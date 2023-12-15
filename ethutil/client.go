@@ -9,6 +9,7 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/ethclient"
+	"github.com/ethereum/go-ethereum/ethclient/gethclient"
 	"github.com/ethereum/go-ethereum/rpc"
 	"github.com/lmittmann/w3"
 	"github.com/lmittmann/w3/module/eth"
@@ -16,6 +17,12 @@ import (
 )
 
 type SignDataFn = func(hash []byte) (sig []byte, err error)
+
+type SignerContext struct {
+	ChainID  *big.Int
+	Signer   common.Address
+	SignData SignDataFn
+}
 
 type ReadOnlyClient interface {
 	bind.ContractBackend
@@ -27,6 +34,7 @@ type ReadOnlyClient interface {
 		hash common.Hash,
 	) (tx *types.Transaction, isPending bool, err error)
 	NewBatchHeaderClient() (BatchHeaderClient, error)
+	GetProof(ctx context.Context, account common.Address, keys []string, blockNumber *big.Int) (*gethclient.AccountResult, error)
 }
 
 type WritableClient interface {
@@ -37,13 +45,14 @@ type WritableClient interface {
 	SignData(data []byte) (sig []byte, err error)
 	SignTx(tx *types.Transaction) (*types.Transaction, error)
 	TransactOpts(ctx context.Context) *bind.TransactOpts
+	SignerContext() *SignerContext
 }
 
 type readOnlyClient struct {
-	ethclient.Client
+	*ethclient.Client
 
 	url string
-	rpc rpc.Client
+	rpc *rpc.Client
 }
 
 func NewReadOnlyClient(url string) (ReadOnlyClient, error) {
@@ -53,9 +62,9 @@ func NewReadOnlyClient(url string) (ReadOnlyClient, error) {
 	}
 
 	return &readOnlyClient{
-		Client: *ethclient.NewClient(rpcClient),
+		Client: ethclient.NewClient(rpcClient),
 		url:    url,
-		rpc:    *rpcClient,
+		rpc:    rpcClient,
 	}, nil
 }
 
@@ -76,6 +85,10 @@ func (c *readOnlyClient) NewBatchHeaderClient() (BatchHeaderClient, error) {
 		return nil, err
 	}
 	return &BatchHeaderRPCClient{client: client}, nil
+}
+
+func (c *readOnlyClient) GetProof(ctx context.Context, account common.Address, keys []string, blockNumber *big.Int) (*gethclient.AccountResult, error) {
+	return gethclient.New(c.rpc).GetProof(ctx, account, keys, blockNumber)
 }
 
 type writableClient struct {
@@ -131,6 +144,14 @@ func (c *writableClient) SignData(data []byte) (sig []byte, err error) {
 
 func (c *writableClient) SignTx(tx *types.Transaction) (*types.Transaction, error) {
 	return c.wallet.SignTx(*c.signer, tx, c.ChainID())
+}
+
+func (c *writableClient) SignerContext() *SignerContext {
+	return &SignerContext{
+		ChainID:  c.ChainID(),
+		Signer:   c.Signer(),
+		SignData: c.SignData,
+	}
 }
 
 type BatchHeaderRPCClient struct {

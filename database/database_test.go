@@ -2,6 +2,7 @@ package database
 
 import (
 	"math/rand"
+	"time"
 
 	"github.com/oasysgames/oasys-optimism-verifier/config"
 	"github.com/oasysgames/oasys-optimism-verifier/testhelper"
@@ -67,4 +68,22 @@ func (s *DatabaseTestSuite) createSignature(
 	}
 	s.NoDBError(s.rawdb.Create(sig))
 	return sig
+}
+
+func (s *DatabaseTestSuite) createL2OO() *OpstackL2OutputOracle {
+	l2oo := &OpstackL2OutputOracle{Address: s.RandAddress()}
+	s.NoDBError(s.rawdb.Create(l2oo))
+	return l2oo
+}
+
+func (s *DatabaseTestSuite) createProposal(l2oo *OpstackL2OutputOracle, l2OutputIndex int) *OpstackProposal {
+	proposal := &OpstackProposal{
+		OpstackL2OutputOracle: *l2oo,
+		OutputRoot:            s.RandHash(),
+		L2OutputIndex:         uint64(l2OutputIndex),
+		L2BlockNumber:         uint64(rand.Intn(99)),
+		L1Timestamp:           uint64(time.Now().Unix()),
+	}
+	s.NoDBError(s.rawdb.Create(proposal))
+	return proposal
 }

@@ -71,7 +71,7 @@ func (s *EventCollectorTestSuite) TestProcessStateBatchDeletedEvent() {
 	}
 
 	// emit `StateBatchDeleted` event
-	s.scc.EmitStateBatchDeleted(
+	s.tscc.EmitStateBatchDeleted(
 		s.hub.TransactOpts(ctx),
 		emits[5].BatchIndex,
 		emits[5].BatchRoot,
@@ -97,7 +97,7 @@ func (s *EventCollectorTestSuite) TestProcessStateBatchDeletedEvent() {
 func (s *EventCollectorTestSuite) TestProcessStateBatchVerifiedEvent() {
 	// emit `EmitStateBatchVerified` events
 	for index := range s.Range(0, 5) {
-		s.scc.EmitStateBatchVerified(
+		s.tscc.EmitStateBatchVerified(
 			s.hub.TransactOpts(context.Background()),
 			big.NewInt(int64(index)),
 			s.RandHash(),
@@ -119,7 +119,7 @@ func (s *EventCollectorTestSuite) TestNoHandleOtherEvent() {
 	// emit `StateBatchAppended` and `Other` events
 	for i := range s.Range(0, 10) {
 		s.emitStateBatchAppendedEvent(i)
-		s.scc.EmitOtherEvent(s.hub.TransactOpts(ctx), big.NewInt(11))
+		s.tscc.EmitOtherEvent(s.hub.TransactOpts(ctx), big.NewInt(11))
 		s.mining()
 	}
 

@@ -16,15 +16,15 @@ import (
 	"github.com/stretchr/testify/suite"
 )
 
-type SccSubmitterTestSuite struct {
+type SubmitterTestSuite struct {
 	SccTestSuite
 }
 
-func TestSccSubmitter(t *testing.T) {
-	suite.Run(t, new(SccSubmitterTestSuite))
+func TestSubmitter(t *testing.T) {
+	suite.Run(t, new(SubmitterTestSuite))
 }
 
-func (s *SccSubmitterTestSuite) TestWork() {
+func (s *SubmitterTestSuite) TestWork() {
 	var (
 		indexes = 5
 
@@ -79,7 +79,7 @@ func (s *SccSubmitterTestSuite) TestWork() {
 		})
 
 		// emit StateBatchAppended event to the test contract
-		s.scc.EmitStateBatchAppended(
+		s.tscc.EmitStateBatchAppended(
 			s.hub.TransactOpts(context.Background()),
 			new(big.Int).SetUint64(batchIndex),
 			batchRoot,
@@ -89,14 +89,14 @@ func (s *SccSubmitterTestSuite) TestWork() {
 		s.mining()
 	}
 
-	s.sccSubmitter.refreshStakes(context.Background())
+	s.submitter.vs.Refresh(context.Background())
 
-	for range s.Range(0, indexes/s.sccSubmitter.cfg.BatchSize+1) {
+	for range s.Range(0, indexes/s.submitter.cfg.BatchSize+1) {
 		go func() {
 			time.Sleep(10 * time.Millisecond)
 			s.hub.Commit()
 		}()
-		s.sccSubmitter.work(context.Background(), &submitTask{scc: s.sccAddr, hub: s.hub})
+		s.submitter.work(context.Background(), NewSccSubmitTask(s.hub, s.sccAddr, s.scc))
 	}
 
 	for i := range s.Range(0, indexes) {
@@ -124,101 +124,70 @@ func (s *SccSubmitterTestSuite) TestWork() {
 	}
 }
 
-func (s *SccSubmitterTestSuite) TestRefreshStakes() {
-	s.Equal(common.Big0, s.sccSubmitter.getTotalStake())
-	s.Equal(map[common.Address]*big.Int{}, s.sccSubmitter.getSignerStakes())
-
-	for i := range s.Range(0, 1000) {
-		s.sm.Owners = append(s.sm.Owners, s.RandAddress())
-		s.sm.Operators = append(s.sm.Operators, s.RandAddress())
-		s.sm.Stakes = append(s.sm.Stakes, big.NewInt(int64(i)))
-		s.sm.Candidates = append(s.sm.Candidates, true)
-		s.sm.NewCursor = big.NewInt(0)
-	}
-	s.sccSubmitter.refreshStakes(context.Background())
-
-	s.Equal(int64(499500), s.sccSubmitter.getTotalStake().Int64())
-
-	signerStakes := s.sccSubmitter.getSignerStakes()
-	s.Len(signerStakes, 1000)
-	for i := range s.Range(0, 1000) {
-		s.Equal(int64(i), signerStakes[s.sm.Operators[i]].Int64())
-	}
+type dummySignature struct {
+	signer    common.Address
+	signature database.Signature
+	key       string
 }
 
-func (s *SccSubmitterTestSuite) TestFindSignatures() {
-	type group struct {
-		signers    []common.Address
-		signatures []*database.OptimismSignature
-		batchRoot  common.Hash
-		approved   bool
-		stake      int64
-	}
+type dummySignatures []*dummySignature
 
+func (sigs dummySignatures) Len() int                           { return len(sigs) }
+func (sigs dummySignatures) Get(i int) interface{}              { return sigs[i] }
+func (sigs dummySignatures) Signer(i int) common.Address        { return sigs[i].signer }
+func (sigs dummySignatures) Signature(i int) database.Signature { return sigs[i].signature }
+func (sigs dummySignatures) Key(i int) string                   { return sigs[i].key }
+
+func (s *SubmitterTestSuite) TestGetTopStakingSignatures() {
 	var (
-		batchRoot0 = s.RandHash()
-		batchRoot1 = s.RandHash()
-		batchIndex = uint64(10)
-
-		totalStake   = big.NewInt(0)
-		signerStakes = map[common.Address]*big.Int{}
-
-		groups = []*group{
-			{batchRoot: batchRoot0, approved: true, stake: 1000},
-			{batchRoot: batchRoot0, approved: false, stake: 2000},
-			{batchRoot: batchRoot1, approved: true, stake: 10000}, // want
-			{batchRoot: batchRoot1, approved: false, stake: 3000},
+		groups = []struct {
+			key        string
+			stake      int64
+			signatures []*dummySignature
+		}{
+			{"group-0", 1000, make([]*dummySignature, 5)},
+			{"group-1", 2000, make([]*dummySignature, 10)},
+			{"group-2", 10000, make([]*dummySignature, 15)}, // want
+			{"group-3", 3000, make([]*dummySignature, 20)},
 		}
 		want = groups[2]
+
+		minStake        = big.NewInt(0)
+		totalStake      = big.NewInt(0)
+		allSignatures   = dummySignatures{}
+		stakeBySigner   = map[common.Address]*big.Int{}
+		stakeBySignerFn = func(addr common.Address) *big.Int {
+			return stakeBySigner[addr]
+		}
 	)
 
 	for _, group := range groups {
 		totalStake.Add(totalStake, big.NewInt(group.stake))
 
-		for i := range s.Range(0, 10) {
-			group.signers = append(group.signers, s.RandAddress())
-			signerStakes[group.signers[i]] = big.NewInt(group.stake / int64(10))
-
-			// create sample signatures
-			sig, _ := s.db.Optimism.SaveSignature(
-				nil, nil,
-				group.signers[i],
-				s.sccAddr,
-				batchIndex,
-				group.batchRoot,
-				0,
-				0,
-				[]byte(nil),
-				group.approved,
-				database.RandSignature(),
-			)
-			group.signatures = append(group.signatures, sig)
+		for i := range s.Range(0, len(group.signatures)) {
+			signer := s.RandAddress()
+			group.signatures[i] = &dummySignature{
+				signer:    signer,
+				signature: database.RandSignature(),
+				key:       group.key,
+			}
+			allSignatures = append(allSignatures, group.signatures[i])
+			stakeBySigner[signer] = big.NewInt(group.stake / int64(len(group.signatures)))
 		}
 	}
-
-	sort.Slice(want.signatures, func(x, y int) bool {
-		return bytes.Compare(
-			want.signatures[x].Signer.Address[:],
-			want.signatures[y].Signer.Address[:],
-		) == -1
+	sort.Slice(want.signatures, func(i, j int) bool {
+		return bytes.Compare(want.signatures[i].signer[:], want.signatures[j].signer[:]) == -1
 	})
 
-	// assert
-	gots, _ := s.sccSubmitter.findSignatures(
-		s.sccAddr, batchIndex, common.Big0, totalStake, signerStakes)
-	s.Len(gots, len(want.signatures))
+	// ok
+	got0, got1, _ := getTopStakingSignatures(allSignatures, minStake, totalStake, stakeBySignerFn)
+	s.Len(got0, len(want.signatures))
+	s.Equal(want.signatures[0].signer, allSignatures[got1].signer)
 	for i, want := range want.signatures {
-		s.Equal(want.Signature, gots[i].Signature)
+		s.Equal(want.signature.Bytes(), got0[i])
 	}
 
-	rows, err := s.sccSubmitter.findSignatures(
-		s.sccAddr, batchIndex+1, common.Big0, totalStake, signerStakes)
-	s.Len(rows, 0)
-	s.NoError(err)
-
-	// stake amount shortage
-	rows, err = s.sccSubmitter.findSignatures(
-		s.sccAddr, batchIndex, common.Big0, big.NewInt(20000), signerStakes)
-	s.Len(rows, 0)
-	s.NoError(err)
+	// error
+	_, _, err := getTopStakingSignatures(allSignatures, minStake, big.NewInt(20000), stakeBySignerFn)
+	s.ErrorContains(err, "stake amount shortage")
 }

@@ -10,6 +10,7 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/oasysgames/oasys-optimism-verifier/config"
 	"github.com/oasysgames/oasys-optimism-verifier/database"
+	"github.com/oasysgames/oasys-optimism-verifier/hublayer/contracts/scc"
 	"github.com/oasysgames/oasys-optimism-verifier/testhelper"
 	tmcall2 "github.com/oasysgames/oasys-optimism-verifier/testhelper/contracts/multicall2"
 	tscc "github.com/oasysgames/oasys-optimism-verifier/testhelper/contracts/scc"
@@ -28,14 +29,15 @@ type SccTestSuite struct {
 	mcall2     *tmcall2.Multicall2
 	mcall2Addr common.Address
 
-	scc     *tscc.Scc
+	scc     *scc.Scc
+	tscc    *tscc.Scc
 	sccAddr common.Address
 
 	sccv     *tsccv.Sccverifier
 	sccvAddr common.Address
 
 	stateCollector *EventCollector
-	sccSubmitter   *SccSubmitter
+	submitter      *Submitter
 }
 
 func (s *SccTestSuite) SetupTest() {
@@ -52,7 +54,8 @@ func (s *SccTestSuite) SetupTest() {
 	s.hub.Mining()
 
 	// deploy `StateCommitmentChain` contract
-	s.sccAddr, _, s.scc, _ = tscc.DeployScc(s.hub.TransactOpts(ctx), s.hub)
+	s.sccAddr, _, s.tscc, _ = tscc.DeployScc(s.hub.TransactOpts(ctx), s.hub)
+	s.scc, _ = scc.NewScc(s.sccAddr, s.hub)
 	s.hub.Mining()
 
 	// deploy `OasysStateCommitmentChainVerifier` contract
@@ -66,7 +69,7 @@ func (s *SccTestSuite) SetupTest() {
 		EventFilterLimit: 1000,
 	}, s.db, s.hub, hubSigner)
 
-	s.sccSubmitter = NewSccSubmitter(&config.Submitter{
+	s.submitter = NewSubmitter(&config.Submitter{
 		Interval:          0,
 		Concurrency:       0,
 		Confirmations:     0,
@@ -76,7 +79,7 @@ func (s *SccTestSuite) SetupTest() {
 		VerifierAddress:   s.sccvAddr.String(),
 		Multicall2Address: s.mcall2Addr.String(),
 	}, s.db, s.sm)
-	s.sccSubmitter.AddVerse(s.sccAddr, s.hub)
+	s.submitter.AddTask(NewSccSubmitTask(s.hub, s.sccAddr, s.scc))
 }
 
 func (s *SccTestSuite) mining() {
@@ -94,7 +97,7 @@ func (s *SccTestSuite) emitStateBatchAppendedEvent(index int) *tscc.SccStateBatc
 		PrevTotalElements: big.NewInt(i64 * 10),
 		ExtraData:         []byte("extra data"),
 	}
-	s.scc.EmitStateBatchAppended(
+	s.tscc.EmitStateBatchAppended(
 		s.hub.TransactOpts(context.Background()), event.BatchIndex,
 		event.BatchRoot, event.BatchSize, event.PrevTotalElements, event.ExtraData)
 	s.mining()

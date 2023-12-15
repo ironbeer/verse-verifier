@@ -18,6 +18,9 @@ var (
 		&OptimismScc{},
 		&OptimismState{},
 		&OptimismSignature{},
+		&OpstackL2OutputOracle{},
+		&OpstackProposal{},
+		&OpstackSignature{},
 	}
 )
 
@@ -26,6 +29,7 @@ type Database struct {
 
 	Block    *BlockDatabase
 	Optimism *OptimismDatabase
+	OPStack  *OPStackDatabase
 }
 
 func NewDatabase(cfg *config.Database) (*Database, error) {
@@ -66,6 +70,7 @@ func newDB(db *gorm.DB) *Database {
 		db:       db,
 		Block:    &BlockDatabase{db: db},
 		Optimism: &OptimismDatabase{db: db},
+		OPStack:  &OPStackDatabase{db: db},
 	}
 }
 

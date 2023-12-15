@@ -8,22 +8,10 @@ import (
 	"github.com/oasysgames/oasys-optimism-verifier/hublayer/contracts/scc"
 	"github.com/oasysgames/oasys-optimism-verifier/util"
 	"gorm.io/gorm"
-	"gorm.io/gorm/clause"
 )
 
 type OptimismDatabase struct {
 	db *gorm.DB
-}
-
-func (db *OptimismDatabase) FindOrCreateSigner(signer common.Address) (*Signer, error) {
-	row := &Signer{Address: signer}
-	tx := db.db.Clauses(clause.OnConflict{
-		Columns: []clause.Column{{Name: "address"}},
-	}).Create(row)
-	if tx.Error != nil {
-		return nil, tx.Error
-	}
-	return row, nil
 }
 
 func (db *OptimismDatabase) FindOrCreateSCC(scc common.Address) (*OptimismScc, error) {
@@ -169,7 +157,7 @@ func (db *OptimismDatabase) SaveSignature(
 	approved bool,
 	signature Signature,
 ) (*OptimismSignature, error) {
-	_signer, err := db.FindOrCreateSigner(signer)
+	_signer, err := findOrCreateSigner(db.db, signer)
 	if err != nil {
 		return nil, err
 	}

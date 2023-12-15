@@ -33,7 +33,7 @@ type SccVerifierTestSuite struct {
 	scc     *tscc.Scc
 	sccAddr common.Address
 
-	verifier *SccVerifier
+	verifier *Verifier
 }
 
 func TestSccVerifier(t *testing.T) {
@@ -51,13 +51,13 @@ func (s *SccVerifierTestSuite) SetupTest() {
 	s.hub.Mining()
 
 	// setup verifier
-	s.verifier = NewSccVerifier(&config.Verifier{
+	s.verifier = NewVerifier(&config.Verifier{
 		Interval:            50 * time.Millisecond,
 		Concurrency:         10,
 		StateCollectLimit:   2,
 		StateCollectTimeout: time.Second,
-	}, s.db, s.hub)
-	s.verifier.AddVerse(s.sccAddr, s.verse)
+	}, s.db, s.hub.SignerContext())
+	s.verifier.AddWorker(NewSccVerifyWorker(s.verse, s.sccAddr, s.scc))
 }
 
 func (s *SccVerifierTestSuite) TestVerify() {
@@ -332,7 +332,7 @@ func (s *SccVerifierTestSuite) fillDefaultHashes(elements [][32]byte) [][32]byte
 }
 
 func (s *SccVerifierTestSuite) startAndWait(
-	verifier *SccVerifier,
+	verifier *Verifier,
 	count int,
 ) []*database.OptimismSignature {
 	ctx, candel := context.WithTimeout(context.Background(), time.Second/2)
@@ -350,9 +350,13 @@ func (s *SccVerifierTestSuite) startAndWait(
 			case <-ctx.Done():
 				return
 			case sig := <-sub.Next():
-				published = append(published, sig)
-				if len(published) == count {
-					return
+				if t, ok := sig.(*database.OptimismSignature); !ok {
+					panic(fmt.Errorf("Unknown signature: %v", sig))
+				} else {
+					published = append(published, t)
+					if len(published) == count {
+						return
+					}
 				}
 			}
 		}

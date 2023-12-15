@@ -16,39 +16,81 @@ import (
 	"github.com/oasysgames/oasys-optimism-verifier/config"
 	"github.com/oasysgames/oasys-optimism-verifier/database"
 	"github.com/oasysgames/oasys-optimism-verifier/ethutil"
+	"github.com/oasysgames/oasys-optimism-verifier/hublayer/contracts/l2oo"
 	"github.com/oasysgames/oasys-optimism-verifier/hublayer/contracts/scc"
 )
 
-const (
-	verseBuildEvent         = "Build"
-	stateBatchAppendedEvent = "StateBatchAppended"
-	stateBatchDeletedEvent  = "StateBatchDeleted"
-	stateBatchVerifiedEvent = "StateBatchVerified"
-)
+type logProcessor struct {
+	abi          *abi.ABI
+	name         string
+	log2event    func(log types.Log) interface{}
+	eventHandler func(w *EventCollector, tx *database.Database, event interface{}) error
+}
 
 var (
-	sccABI                  abi.ABI
-	stateBatchAppendedTopic common.Hash
-	stateBatchDeletedTopic  common.Hash
-	stateBatchVerifiedTopic common.Hash
-	filterTopics            [][]common.Hash
+	filterTopics [][]common.Hash
+	processors   []*logProcessor
 )
 
 func init() {
+	// Events of legacy optimism
 	if parsed, err := abi.JSON(strings.NewReader(scc.SccABI)); err != nil {
 		panic(err)
 	} else {
-		sccABI = parsed
+		processors = append(processors,
+			&logProcessor{
+				abi:          &parsed,
+				name:         "StateBatchAppended",
+				log2event:    func(log types.Log) interface{} { return &scc.SccStateBatchAppended{Raw: log} },
+				eventHandler: handleStateBatchAppendedEvent,
+			},
+			&logProcessor{
+				abi:          &parsed,
+				name:         "StateBatchDeleted",
+				log2event:    func(log types.Log) interface{} { return &scc.SccStateBatchDeleted{Raw: log} },
+				eventHandler: handleStateBatchDeletedEvent,
+			},
+			&logProcessor{
+				abi:          &parsed,
+				name:         "StateBatchVerified",
+				log2event:    func(log types.Log) interface{} { return &scc.SccStateBatchVerified{Raw: log} },
+				eventHandler: handleStateBatchVerifiedEvent,
+			})
 	}
 
-	stateBatchAppendedTopic = sccABI.Events[stateBatchAppendedEvent].ID
-	stateBatchDeletedTopic = sccABI.Events[stateBatchDeletedEvent].ID
-	stateBatchVerifiedTopic = sccABI.Events[stateBatchVerifiedEvent].ID
-	filterTopics = [][]common.Hash{{
-		stateBatchAppendedTopic,
-		stateBatchDeletedTopic,
-		stateBatchVerifiedTopic,
-	}}
+	// Events of opstack
+	if parsed, err := abi.JSON(strings.NewReader(l2oo.OasysL2OutputOracleABI)); err != nil {
+		panic(err)
+	} else {
+		processors = append(processors,
+			&logProcessor{
+				abi:          &parsed,
+				name:         "OutputProposed",
+				log2event:    func(log types.Log) interface{} { return &l2oo.OasysL2OutputOracleOutputProposed{Raw: log} },
+				eventHandler: handleOutputProposedEvent,
+			},
+			&logProcessor{
+				abi:          &parsed,
+				name:         "OutputsDeleted",
+				log2event:    func(log types.Log) interface{} { return &l2oo.OasysL2OutputOracleOutputsDeleted{Raw: log} },
+				eventHandler: handleOutputsDeletedEvent,
+			},
+			&logProcessor{
+				abi:          &parsed,
+				name:         "L2OutputVerified",
+				log2event:    func(log types.Log) interface{} { return &l2oo.OasysL2OutputOracleL2OutputVerified{Raw: log} },
+				eventHandler: handleL2OutputVerifiedEvent,
+			})
+	}
+
+	filterTopics = append(filterTopics, []common.Hash{})
+	for _, p := range processors {
+		if ae, ok := p.abi.Events[p.name]; !ok {
+			panic(fmt.Sprintf("Failed to get event topic(name=%s) from ABI.", p.name))
+		} else {
+			filterTopics[0] = append(filterTopics[0], ae.ID)
+		}
+	}
 }
 
 // Worker to collect events for OasysStateCommitmentChain.
@@ -139,29 +181,43 @@ func (w *EventCollector) work(ctx context.Context) {
 
 // Parse event logs and save to database.
 func (w *EventCollector) processLog(tx *database.Database, log types.Log) error {
-	event, err := parseLog(log)
-	if err != nil {
-		w.log.Error("Failed to parse event log",
-			"block", log.BlockNumber, "scc", log.Address.Hex(), "err", err)
-		return err
+	var processor *logProcessor
+	for _, p := range processors {
+		if p.abi.Events[p.name].ID == log.Topics[0] {
+			processor = p
+			break
+		}
+	}
+	if processor == nil {
+		return fmt.Errorf("unknown log topic: %s", log.Topics[0])
 	}
 
-	switch t := event.(type) {
-	case *scc.SccStateBatchAppended:
-		return w.processStateBatchAppendedEvent(tx, t)
-	case *scc.SccStateBatchDeleted:
-		return w.processStateBatchDeletedEvent(tx, t)
-	case *scc.SccStateBatchVerified:
-		return w.processStateBatchVerifiedEvent(tx, t)
+	event := processor.log2event(log)
+	if err := processor.abi.UnpackIntoInterface(event, processor.name, log.Data); err != nil {
+		return fmt.Errorf("failed to unpack log data: %w", err)
 	}
 
-	return nil
+	var indexed abi.Arguments
+	for _, arg := range processor.abi.Events[processor.name].Inputs {
+		if arg.Indexed {
+			indexed = append(indexed, arg)
+		}
+	}
+
+	if err := abi.ParseTopics(event, indexed, log.Topics[1:]); err != nil {
+		return fmt.Errorf("failed to parse indexed log data: %w", err)
+	}
+
+	return processor.eventHandler(w, tx, event)
 }
 
-func (w *EventCollector) processStateBatchAppendedEvent(
-	tx *database.Database,
-	e *scc.SccStateBatchAppended,
-) error {
+// Event handlers for StateCommitmentChain of Legacy Optimism
+func handleStateBatchAppendedEvent(w *EventCollector, tx *database.Database, event interface{}) error {
+	e, ok := event.(*scc.SccStateBatchAppended)
+	if !ok {
+		return fmt.Errorf("event type mismatch(%v)", event)
+	}
+
 	var (
 		address    = e.Raw.Address
 		batchIndex = e.BatchIndex.Uint64()
@@ -198,10 +254,12 @@ func (w *EventCollector) processStateBatchAppendedEvent(
 	return nil
 }
 
-func (w *EventCollector) processStateBatchDeletedEvent(
-	tx *database.Database,
-	e *scc.SccStateBatchDeleted,
-) error {
+func handleStateBatchDeletedEvent(w *EventCollector, tx *database.Database, event interface{}) error {
+	e, ok := event.(*scc.SccStateBatchDeleted)
+	if !ok {
+		return fmt.Errorf("event type mismatch(%v)", event)
+	}
+
 	var (
 		address    = e.Raw.Address
 		batchIndex = e.BatchIndex.Uint64()
@@ -232,10 +290,12 @@ func (w *EventCollector) processStateBatchDeletedEvent(
 	return nil
 }
 
-func (w *EventCollector) processStateBatchVerifiedEvent(
-	tx *database.Database,
-	e *scc.SccStateBatchVerified,
-) error {
+func handleStateBatchVerifiedEvent(w *EventCollector, tx *database.Database, event interface{}) error {
+	e, ok := event.(*scc.SccStateBatchVerified)
+	if !ok {
+		return fmt.Errorf("event type mismatch(%v)", event)
+	}
+
 	nextIndex := e.BatchIndex.Uint64() + 1
 
 	logCtx := []interface{}{
@@ -252,6 +312,107 @@ func (w *EventCollector) processStateBatchVerifiedEvent(
 	return nil
 }
 
+// Event handlers for L2OutputOracle of OPStack
+func handleOutputProposedEvent(w *EventCollector, tx *database.Database, event interface{}) error {
+	e, ok := event.(*l2oo.OasysL2OutputOracleOutputProposed)
+	if !ok {
+		return fmt.Errorf("event type mismatch(%v)", event)
+	}
+
+	var (
+		address     = e.Raw.Address
+		outputIndex = e.L2OutputIndex.Uint64()
+		logCtx      = []interface{}{
+			"block", e.Raw.BlockNumber,
+			"l2oo", address.Hex(),
+			"index", outputIndex,
+		}
+	)
+	w.log.Info("New L2OO.OutputProposed event", logCtx...)
+
+	// delete the `OPStackProposal` records in consideration of chain reorganization
+	if rows, err := tx.OPStack.DeleteProposals(address, outputIndex); err != nil {
+		w.log.Error("Failed to delete reorganized proposals", append(logCtx, "err", err)...)
+		return err
+	} else if rows > 0 {
+		w.log.Info("Deleted reorganized proposals", append(logCtx, "rows", rows)...)
+	}
+
+	// delete the `OPStackSignature` records in consideration of chain reorganization
+	if rows, err := tx.OPStack.DeleteSignatures(w.signer, address, outputIndex); err != nil {
+		w.log.Error("Failed to delete reorganized signatures",
+			append(logCtx, "err", err)...)
+		return err
+	} else if rows > 0 {
+		w.log.Info("Deleted reorganized signatures", append(logCtx, "rows", rows)...)
+	}
+
+	// save new state
+	if _, err := tx.OPStack.SaveProposal(e); err != nil {
+		w.log.Error("Failed to save L2OO.OutputProposed event", append(logCtx, "err", err)...)
+		return err
+	}
+	return nil
+}
+
+func handleOutputsDeletedEvent(w *EventCollector, tx *database.Database, event interface{}) error {
+	e, ok := event.(*l2oo.OasysL2OutputOracleOutputsDeleted)
+	if !ok {
+		return fmt.Errorf("event type mismatch(%v)", event)
+	}
+
+	var (
+		address     = e.Raw.Address
+		outputIndex = e.NewNextOutputIndex.Uint64()
+		logCtx      = []interface{}{
+			"block", e.Raw.BlockNumber,
+			"l2oo", address.Hex(),
+			"index", outputIndex,
+		}
+	)
+	w.log.Info("New L2OO.OutputsDeleted event", logCtx...)
+
+	// delete `OPStackProposal` records after target outputIndex
+	if rows, err := tx.OPStack.DeleteProposals(address, outputIndex); err != nil {
+		w.log.Error("Failed to delete states", append(logCtx, "err", err)...)
+		return err
+	} else if rows > 0 {
+		w.log.Info("Deleted states", append(logCtx, "rows", rows)...)
+	}
+
+	// delete the `OPStackSignature` records in consideration of chain reorganization
+	if rows, err := tx.OPStack.DeleteSignatures(w.signer, address, outputIndex); err != nil {
+		w.log.Error("Failed to delete reorganized signatures", append(logCtx, "err", err)...)
+		return err
+	} else if rows > 0 {
+		w.log.Info("Deleted reorganized signatures", append(logCtx, "rows", rows)...)
+	}
+
+	return nil
+}
+
+func handleL2OutputVerifiedEvent(w *EventCollector, tx *database.Database, event interface{}) error {
+	e, ok := event.(*l2oo.OasysL2OutputOracleL2OutputVerified)
+	if !ok {
+		return fmt.Errorf("event type mismatch(%v)", event)
+	}
+
+	nextVerifyIndex := e.L2OutputIndex.Uint64() + 1
+
+	logCtx := []interface{}{
+		"block", e.Raw.BlockNumber,
+		"scc", e.Raw.Address.Hex(),
+		"next-verify-index", nextVerifyIndex,
+	}
+	w.log.Info("New L2OO.L2OutputVerified event", logCtx...)
+
+	if err := tx.OPStack.SaveNextVerifyIndex(e.Raw.Address, nextVerifyIndex); err != nil {
+		w.log.Error("Failed to save next index", append(logCtx, "err", err)...)
+		return err
+	}
+	return nil
+}
+
 func (w *EventCollector) saveLogCollectedBlocks(tx *database.Database, start, end uint64) error {
 	// save collected blocks
 	for number := start; number <= end; number++ {
@@ -261,41 +422,4 @@ func (w *EventCollector) saveLogCollectedBlocks(tx *database.Database, start, en
 		}
 	}
 	return nil
-}
-
-func parseLog(log types.Log) (interface{}, error) {
-	var (
-		event string
-		out   interface{}
-	)
-	switch log.Topics[0] {
-	case stateBatchAppendedTopic:
-		event = stateBatchAppendedEvent
-		out = &scc.SccStateBatchAppended{Raw: log}
-	case stateBatchDeletedTopic:
-		event = stateBatchDeletedEvent
-		out = &scc.SccStateBatchDeleted{Raw: log}
-	case stateBatchVerifiedTopic:
-		event = stateBatchVerifiedEvent
-		out = &scc.SccStateBatchVerified{Raw: log}
-	default:
-		return nil, fmt.Errorf("invalid log topic: %s", log.Topics[0].String())
-	}
-
-	if err := sccABI.UnpackIntoInterface(out, event, log.Data); err != nil {
-		return nil, fmt.Errorf("failed to unpack log data: %w", err)
-	}
-
-	var indexed abi.Arguments
-	for _, arg := range sccABI.Events[event].Inputs {
-		if arg.Indexed {
-			indexed = append(indexed, arg)
-		}
-	}
-
-	if err := abi.ParseTopics(out, indexed, log.Topics[1:]); err != nil {
-		return nil, fmt.Errorf("failed to parse indexed log data: %w", err)
-	}
-
-	return out, nil
 }

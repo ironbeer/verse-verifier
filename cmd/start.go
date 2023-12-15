@@ -24,6 +24,8 @@ import (
 	"github.com/oasysgames/oasys-optimism-verifier/database"
 	"github.com/oasysgames/oasys-optimism-verifier/ethutil"
 	"github.com/oasysgames/oasys-optimism-verifier/hublayer"
+	"github.com/oasysgames/oasys-optimism-verifier/hublayer/contracts/l2oo"
+	"github.com/oasysgames/oasys-optimism-verifier/hublayer/contracts/scc"
 	"github.com/oasysgames/oasys-optimism-verifier/hublayer/contracts/stakemanager"
 	"github.com/oasysgames/oasys-optimism-verifier/ipc"
 	"github.com/oasysgames/oasys-optimism-verifier/p2p"
@@ -36,6 +38,7 @@ import (
 
 const (
 	SccName             = "StateCommitmentChain"
+	L2OOName            = "L2OutputOracle"
 	StakeManagerAddress = "0x0000000000000000000000000000000000001001"
 )
 
@@ -120,11 +123,23 @@ func runStartCmd(cmd *cobra.Command, args []string) {
 		}()
 	}
 
+	// Construct the L1 RPC Client
+	wallet, account := findWallet(conf, ks, conf.Verifier.Wallet)
+	l1Client, err := ethutil.NewWritableClient(
+		new(big.Int).SetUint64(conf.HubLayer.ChainId),
+		conf.HubLayer.RPC,
+		wallet,
+		account,
+	)
+	if err != nil {
+		log.Crit("Failed to create hub-layer clinet", "err", err)
+	}
+
 	// construct state verifier
-	sccVerifier := newSccVerifier(ctx, conf, ks, db)
+	verifier := newVerifier(conf, db, l1Client)
 
 	//  start p2p
-	p2p := newP2P(ctx, conf, db, sccVerifier)
+	p2p := newP2P(ctx, conf, db, verifier)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -132,16 +147,16 @@ func runStartCmd(cmd *cobra.Command, args []string) {
 	}()
 
 	// start state verifier
-	if sccVerifier != nil {
+	if verifier != nil {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			startSccVerifier(ctx, conf, db, sccVerifier, p2p)
+			startVerifier(ctx, conf, db, l1Client, verifier, p2p)
 		}()
 	}
 
 	// start beacon worker
-	if sccVerifier != nil && conf.Beacon.Enable {
+	if verifier != nil && conf.Beacon.Enable {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -149,7 +164,7 @@ func runStartCmd(cmd *cobra.Command, args []string) {
 				&conf.Beacon,
 				http.DefaultClient,
 				beacon.Beacon{
-					Signer:  sccVerifier.Signer().Signer().String(),
+					Signer:  verifier.Signer().Signer.String(),
 					Version: version.SemVer(),
 					PeerID:  p2p.PeerID().String(),
 				},
@@ -159,12 +174,12 @@ func runStartCmd(cmd *cobra.Command, args []string) {
 	}
 
 	// start signature submitter
-	sccSubmitter := newSccSubmitter(ctx, conf, ks, db, hub)
-	if sccSubmitter != nil {
+	submitter := newSubmitter(ctx, conf, ks, db, hub)
+	if submitter != nil {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			sccSubmitter.Start(ctx)
+			submitter.Start(ctx)
 		}()
 	}
 
@@ -172,7 +187,7 @@ func runStartCmd(cmd *cobra.Command, args []string) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		startVerseDiscovery(ctx, conf, ks, sccVerifier, sccSubmitter)
+		startVerseDiscovery(ctx, conf, ks, l1Client, verifier, submitter)
 	}()
 
 	wg.Wait()
@@ -279,7 +294,7 @@ func newP2P(
 	ctx context.Context,
 	c *config.Config,
 	db *database.Database,
-	verifier *verselayer.SccVerifier,
+	verifier *verselayer.Verifier,
 ) *p2p.Node {
 	// get p2p private key
 	p2pKey, err := getOrCreateP2PKey(c.P2PKeyPath())
@@ -307,7 +322,7 @@ func newP2P(
 				case <-ctx.Done():
 					return
 				case <-ticker.C:
-					p2p.ConnectPeers(ctx, host, p2p.ConvertPeers(c.P2P.Bootnodes))
+					p2p.ConnectPeers(ctx, host, bootstrapPeers)
 				}
 			}
 		}()
@@ -316,7 +331,7 @@ func newP2P(
 	// ignore self-signed signatures
 	ignoreSigners := []common.Address{}
 	if verifier != nil {
-		ignoreSigners = append(ignoreSigners, verifier.Signer().Signer())
+		ignoreSigners = append(ignoreSigners, verifier.Signer().Signer)
 	}
 
 	node, err := p2p.NewNode(&c.P2P, db, host, dht, bwm, c.HubLayer.ChainId, ignoreSigners)
@@ -356,37 +371,20 @@ func newEventCollector(
 	)
 }
 
-func newSccVerifier(
-	ctx context.Context,
-	c *config.Config,
-	ks *wallet.KeyStore,
-	db *database.Database,
-) *verselayer.SccVerifier {
+func newVerifier(c *config.Config, db *database.Database, l1Client ethutil.WritableClient) *verselayer.Verifier {
 	if !c.Verifier.Enable {
 		return nil
 	}
-
-	wallet, account := findWallet(c, ks, c.Verifier.Wallet)
-	signer, err := ethutil.NewWritableClient(
-		new(big.Int).SetUint64(c.HubLayer.ChainId),
-		c.HubLayer.RPC,
-		wallet,
-		account,
-	)
-	if err != nil {
-		log.Crit("Failed to create hub-layer clinet", "err", err)
-	}
-
-	return verselayer.NewSccVerifier(&c.Verifier, db, signer)
+	return verselayer.NewVerifier(&c.Verifier, db, l1Client.SignerContext())
 }
 
-func newSccSubmitter(
+func newSubmitter(
 	ctx context.Context,
 	c *config.Config,
 	ks *wallet.KeyStore,
 	db *database.Database,
 	hub ethutil.ReadOnlyClient,
-) *hublayer.SccSubmitter {
+) *hublayer.Submitter {
 	if !c.Submitter.Enable {
 		return nil
 	}
@@ -396,16 +394,21 @@ func newSccSubmitter(
 		log.Crit("Failed to create StakeManager", "err", err)
 	}
 
-	return hublayer.NewSccSubmitter(&c.Submitter, db, sm)
+	return hublayer.NewSubmitter(&c.Submitter, db, sm)
 }
 
 func startVerseDiscovery(
 	ctx context.Context,
 	c *config.Config,
 	ks *wallet.KeyStore,
-	verifier *verselayer.SccVerifier,
-	submitter *hublayer.SccSubmitter,
+	l1Client ethutil.ReadOnlyClient,
+	verifier *verselayer.Verifier,
+	submitter *hublayer.Submitter,
 ) {
+	if !c.Verifier.Enable && !c.Submitter.Enable {
+		return
+	}
+
 	notify := make(chan struct{}, 1)
 	verses := &sync.Map{}
 	for _, v := range c.VerseLayer.Directs {
@@ -425,32 +428,53 @@ func startVerseDiscovery(
 						return true
 					}
 
-					// get contract address
-					var scc common.Address
-					if s, ok := verse.L1Contracts[SccName]; !ok {
-						return true
-					} else {
-						scc = common.HexToAddress(s)
+					// get contract address and construct rollup contracts
+					var (
+						sccAddr, l2ooAddr common.Address
+						scc_              *scc.Scc
+						l2oo_             *l2oo.OasysL2OutputOracle
+						err               error
+					)
+					if s, ok := verse.L1Contracts[SccName]; ok {
+						sccAddr = common.HexToAddress(s)
+						if scc_, err = scc.NewScc(sccAddr, l1Client); err != nil {
+							log.Error("Failed to construct OasysStateCommitmentChain client", "err", err)
+							return true
+						}
 					}
-
-					// add verse to SccVerifier
-					if c.Verifier.Enable {
-						if client, err := ethutil.NewReadOnlyClient(verse.RPC); err != nil {
-							log.Error("Failed to create verse-layer client", "err", err)
-						} else if !verifier.HasVerse(scc, client) {
-							verifier.AddVerse(scc, client)
+					if s, ok := verse.L1Contracts[L2OOName]; ok {
+						l2ooAddr = common.HexToAddress(s)
+						if l2oo_, err = l2oo.NewOasysL2OutputOracle(l2ooAddr, l1Client); err != nil {
+							log.Error("Failed to construct OasysL2OutputOracle client", "err", err)
+							return true
 						}
 					}
 
-					// add verse to SccSubmitter
-					if c.Submitter.Enable && !submitter.HasVerse(scc) {
+					// add verse to Verifier
+					if c.Verifier.Enable {
+						l2Client, err := ethutil.NewReadOnlyClient(verse.RPC)
+						if err != nil {
+							log.Error("Failed to create verse-layer client", "err", err)
+							return true
+						}
+
+						if scc_ != nil {
+							verifier.AddWorker(verselayer.NewSccVerifyWorker(l2Client, sccAddr, scc_))
+						}
+						if l2oo_ != nil {
+							verifier.AddWorker(verselayer.NewL2OOVerifyWorker(l2Client, l2ooAddr, l2oo_))
+						}
+					}
+
+					// add verse to Submitter
+					if c.Submitter.Enable {
 						for _, t := range c.Submitter.Targets {
 							if t.ChainID != verse.ChainID {
 								continue
 							}
 
 							wallet, account := findWallet(c, ks, t.Wallet)
-							hubClient, err := ethutil.NewWritableClient(
+							l1Client, err := ethutil.NewWritableClient(
 								new(big.Int).SetUint64(c.HubLayer.ChainId),
 								c.HubLayer.RPC,
 								wallet,
@@ -458,8 +482,14 @@ func startVerseDiscovery(
 							)
 							if err != nil {
 								log.Error("Failed to create hub-layer client", "err", err)
-							} else {
-								submitter.AddVerse(scc, hubClient)
+								return true
+							}
+
+							if scc_ != nil {
+								submitter.AddTask(hublayer.NewSccSubmitTask(l1Client, sccAddr, scc_))
+							}
+							if l2oo_ != nil {
+								submitter.AddTask(hublayer.NewL2OOSubmitTask(l1Client, l2ooAddr, l2oo_))
 							}
 
 							break
@@ -502,11 +532,12 @@ func startVerseDiscovery(
 	discv.Start(ctx)
 }
 
-func startSccVerifier(
+func startVerifier(
 	ctx context.Context,
 	c *config.Config,
 	db *database.Database,
-	verifier *verselayer.SccVerifier,
+	l1Client ethutil.WritableClient,
+	verifier *verselayer.Verifier,
 	p2p *p2p.Node,
 ) {
 	wg := &sync.WaitGroup{}
@@ -530,7 +561,7 @@ func startSccVerifier(
 			case <-ctx.Done():
 				return
 			case <-tick.C:
-				db.Optimism.RepairPreviousID(verifier.Signer().Signer())
+				db.Optimism.RepairPreviousID(l1Client.Signer())
 			}
 		}
 	}()
@@ -548,7 +579,12 @@ func startSccVerifier(
 			case <-ctx.Done():
 				return
 			case sig := <-sub.Next():
-				p2p.PublishSignatures(ctx, []*database.OptimismSignature{sig})
+				switch t := sig.(type) {
+				case *database.OptimismSignature:
+					p2p.PublishSignatures(ctx, []*database.OptimismSignature{t})
+				case *database.OpstackSignature:
+					// TODO
+				}
 			}
 		}
 	}()

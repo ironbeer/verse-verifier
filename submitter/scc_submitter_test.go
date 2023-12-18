@@ -1,9 +1,10 @@
-package hublayer
+package submitter
 
 import (
 	"bytes"
 	"context"
 	"fmt"
+	"math"
 	"math/big"
 	"sort"
 	"testing"
@@ -12,16 +13,39 @@ import (
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/params"
+	"github.com/oasysgames/oasys-optimism-verifier/config"
 	"github.com/oasysgames/oasys-optimism-verifier/database"
+	"github.com/oasysgames/oasys-optimism-verifier/testhelper"
+	"github.com/oasysgames/oasys-optimism-verifier/testhelper/backend"
 	"github.com/stretchr/testify/suite"
 )
 
 type SubmitterTestSuite struct {
-	SccTestSuite
+	testhelper.Suite
+	backend.BackendSuite
+
+	submitter *Submitter
 }
 
 func TestSubmitter(t *testing.T) {
 	suite.Run(t, new(SubmitterTestSuite))
+}
+
+func (s *SubmitterTestSuite) SetupTest() {
+	s.BackendSuite.SetupTest()
+
+	s.submitter = NewSubmitter(&config.Submitter{
+		Interval:          0,
+		Concurrency:       0,
+		Confirmations:     0,
+		GasMultiplier:     1.0,
+		BatchSize:         2,
+		MaxGas:            math.MaxInt,
+		VerifierAddress:   s.SCCVAddr.String(),
+		Multicall2Address: s.Mcall2Addr.String(),
+	}, s.DB, s.StakeManager)
+
+	s.submitter.AddTask(NewSccSubmitTask(s.Hub, s.SCCAddr, s.SCC))
 }
 
 func (s *SubmitterTestSuite) TestWork() {
@@ -35,14 +59,14 @@ func (s *SubmitterTestSuite) TestWork() {
 	for i := range s.Range(0, len(signers)) {
 		signers[i] = s.RandAddress()
 
-		s.sm.Owners = append(s.sm.Owners, s.RandAddress())
-		s.sm.Operators = append(s.sm.Operators, signers[i])
-		s.sm.Stakes = append(
-			s.sm.Stakes,
+		s.StakeManager.Owners = append(s.StakeManager.Owners, s.RandAddress())
+		s.StakeManager.Operators = append(s.StakeManager.Operators, signers[i])
+		s.StakeManager.Stakes = append(
+			s.StakeManager.Stakes,
 			new(big.Int).Mul(big.NewInt(params.Ether), big.NewInt(10_000_000)),
 		)
-		s.sm.Candidates = append(s.sm.Candidates, true)
-		s.sm.NewCursor = big.NewInt(0)
+		s.StakeManager.Candidates = append(s.StakeManager.Candidates, true)
+		s.StakeManager.NewCursor = big.NewInt(0)
 	}
 
 	for i := range s.Range(0, indexes) {
@@ -57,10 +81,10 @@ func (s *SubmitterTestSuite) TestWork() {
 
 		// create sample signatures
 		for j := range s.Range(0, len(signers)) {
-			sig, _ := s.db.Optimism.SaveSignature(
+			sig, _ := s.DB.Optimism.SaveSignature(
 				nil, nil,
 				signers[j],
-				s.sccAddr,
+				s.SCCAddr,
 				batchIndex,
 				batchRoot,
 				batchSize,
@@ -79,33 +103,33 @@ func (s *SubmitterTestSuite) TestWork() {
 		})
 
 		// emit StateBatchAppended event to the test contract
-		s.tscc.EmitStateBatchAppended(
-			s.hub.TransactOpts(context.Background()),
+		s.TSCC.EmitStateBatchAppended(
+			s.Hub.TransactOpts(context.Background()),
 			new(big.Int).SetUint64(batchIndex),
 			batchRoot,
 			new(big.Int).SetUint64(batchSize),
 			new(big.Int).SetUint64(prevTotalElements),
 			extraData)
-		s.mining()
+		s.Mining()
 	}
 
-	s.submitter.vs.Refresh(context.Background())
+	s.submitter.stakeCache.Refresh(context.Background())
 
 	for range s.Range(0, indexes/s.submitter.cfg.BatchSize+1) {
 		go func() {
 			time.Sleep(10 * time.Millisecond)
-			s.hub.Commit()
+			s.Hub.Commit()
 		}()
-		s.submitter.work(context.Background(), NewSccSubmitTask(s.hub, s.sccAddr, s.scc))
+		s.submitter.work(context.Background(), NewSccSubmitTask(s.Hub, s.SCCAddr, s.SCC))
 	}
 
 	for i := range s.Range(0, indexes) {
-		got, _ := s.sccv.AssertLogs(
+		got, _ := s.SCCV.SccAssertLogs(
 			&bind.CallOpts{Context: context.Background()},
 			big.NewInt(int64(i)),
 		)
 
-		s.Equal(s.sccAddr, got.StateCommitmentChain)
+		s.Equal(s.SCCAddr, got.StateCommitmentChain)
 
 		s.Equal(uint64(i), got.BatchHeader.BatchIndex.Uint64())
 		s.Equal(signatures[i][0].BatchRoot[:], got.BatchHeader.BatchRoot[:])

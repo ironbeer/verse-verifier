@@ -5,12 +5,14 @@ import (
 	"strings"
 
 	"github.com/ethereum/go-ethereum/common"
-	"github.com/oasysgames/oasys-optimism-verifier/hublayer/contracts/scc"
+	"github.com/oasysgames/oasys-optimism-verifier/contract/scc"
 	"github.com/oasysgames/oasys-optimism-verifier/util"
 	"gorm.io/gorm"
 )
 
 type OptimismDatabase struct {
+	*SignerDatabase
+
 	db *gorm.DB
 }
 
@@ -157,7 +159,7 @@ func (db *OptimismDatabase) SaveSignature(
 	approved bool,
 	signature Signature,
 ) (*OptimismSignature, error) {
-	_signer, err := findOrCreateSigner(db.db, signer)
+	_signer, err := db.FindOrCreateSigner(signer)
 	if err != nil {
 		return nil, err
 	}

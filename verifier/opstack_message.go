@@ -1,4 +1,4 @@
-package verselayer
+package verifier
 
 import (
 	"bytes"
@@ -10,40 +10,45 @@ import (
 	"github.com/oasysgames/oasys-optimism-verifier/ethutil"
 )
 
-type SccMessage struct {
+type OpstackMessage struct {
 	AbiPacked []byte
 	Eip712Msg string
 }
 
-func NewSccMessage(
+func NewOpstackMessage(
 	hubChainID *big.Int,
-	scc common.Address,
-	batchIndex *big.Int,
-	batchRoot [32]byte,
+	l2oo_ common.Address,
+	l2OutputIndex *big.Int,
+	outputRoot common.Hash,
+	l1Timestamp *big.Int,
+	l2BlockNumber *big.Int,
 	approved bool,
-) *SccMessage {
+) *OpstackMessage {
 	_approved := []byte{0}
 	if approved {
 		_approved = []byte{1}
 	}
 
-	// See: https://github.com/oasysgames/oasys-optimism/blob/5186190c3250121179064b70d8e2fbd2d0a03ce3/packages/contracts/contracts/oasys/L1/rollup/OasysStateCommitmentChainVerifier.sol#L111-L119
 	abiPacked := bytes.Join([][]byte{
 		common.LeftPadBytes(hubChainID.Bytes(), 32),
-		scc[:],
-		common.LeftPadBytes(batchIndex.Bytes(), 32),
-		batchRoot[:],
+		l2oo_[:],
+		common.LeftPadBytes(l2OutputIndex.Bytes(), 32),
+		bytes.Join([][]byte{
+			outputRoot[:], // bytes32
+			common.LeftPadBytes(l1Timestamp.Bytes(), 16),   // uint128
+			common.LeftPadBytes(l2BlockNumber.Bytes(), 16), // uint128
+		}, nil),
 		_approved,
 	}, nil)
 	_, msg := accounts.TextAndHash(crypto.Keccak256(abiPacked))
 
-	return &SccMessage{
+	return &OpstackMessage{
 		AbiPacked: abiPacked,
 		Eip712Msg: msg,
 	}
 }
 
-func (m *SccMessage) Signature(signDataFn ethutil.SignDataFn) ([65]byte, error) {
+func (m *OpstackMessage) Signature(signDataFn ethutil.SignDataFn) ([65]byte, error) {
 	var sig [65]byte
 	signed, err := signDataFn([]byte(m.Eip712Msg))
 	if err != nil {
@@ -56,12 +61,12 @@ func (m *SccMessage) Signature(signDataFn ethutil.SignDataFn) ([65]byte, error) 
 	return sig, nil
 }
 
-func (m *SccMessage) Ecrecover(signature []byte) (common.Address, error) {
+func (m *OpstackMessage) Ecrecover(signature []byte) (common.Address, error) {
 	hash := crypto.Keccak256([]byte(m.Eip712Msg))
 	return ethutil.Ecrecover(hash, signature)
 }
 
-func (m *SccMessage) VerifySigner(signature []byte, signer common.Address) (bool, error) {
+func (m *OpstackMessage) VerifySigner(signature []byte, signer common.Address) (bool, error) {
 	if recoverd, err := m.Ecrecover(signature); err != nil {
 		return false, err
 	} else {

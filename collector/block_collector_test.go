@@ -1,4 +1,4 @@
-package hublayer
+package collector
 
 import (
 	"context"
@@ -13,6 +13,7 @@ import (
 	"github.com/oasysgames/oasys-optimism-verifier/database"
 	"github.com/oasysgames/oasys-optimism-verifier/ethutil"
 	"github.com/oasysgames/oasys-optimism-verifier/testhelper"
+	"github.com/oasysgames/oasys-optimism-verifier/testhelper/backend"
 	"github.com/stretchr/testify/suite"
 )
 
@@ -20,7 +21,7 @@ type BlockCollectorTestSuite struct {
 	testhelper.Suite
 
 	db      *database.Database
-	backend *testhelper.TestBackend
+	backend *backend.TestBackend
 }
 
 func TestBlockCollector(t *testing.T) {
@@ -29,7 +30,7 @@ func TestBlockCollector(t *testing.T) {
 
 func (s *BlockCollectorTestSuite) SetupTest() {
 	s.db, _ = database.NewDatabase(&config.Database{Path: ":memory:"})
-	s.backend = testhelper.NewTestBackend()
+	s.backend = backend.NewTestBackend()
 }
 
 func (s *BlockCollectorTestSuite) TestCollectNewBlocks() {
@@ -105,7 +106,7 @@ func (s *BlockCollectorTestSuite) TestHandleReorganization() {
 }
 
 type reorgBackend struct {
-	*testhelper.TestBackend
+	*backend.TestBackend
 
 	mu *sync.Mutex
 	do bool
@@ -114,7 +115,7 @@ type reorgBackend struct {
 }
 
 func newReorgBackend(
-	tb *testhelper.TestBackend,
+	tb *backend.TestBackend,
 	mined []*types.Header,
 	reorgedBlock uint64,
 ) *reorgBackend {
@@ -154,7 +155,7 @@ func (r *reorgBackend) reorg() {
 }
 
 func (r *reorgBackend) NewBatchHeaderClient() (ethutil.BatchHeaderClient, error) {
-	return &testhelper.TestBatchHeaderClient{ReadOnlyClient: r}, nil
+	return &backend.TestBatchHeaderClient{ReadOnlyClient: r}, nil
 }
 
 func (r *reorgBackend) HeaderByNumber(_ context.Context, b *big.Int) (*types.Header, error) {

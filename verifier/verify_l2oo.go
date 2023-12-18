@@ -1,4 +1,4 @@
-package verselayer
+package verifier
 
 import (
 	"bytes"
@@ -7,9 +7,9 @@ import (
 
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/oasysgames/oasys-optimism-verifier/contract/l2oo"
 	"github.com/oasysgames/oasys-optimism-verifier/database"
 	"github.com/oasysgames/oasys-optimism-verifier/ethutil"
-	"github.com/oasysgames/oasys-optimism-verifier/hublayer/contracts/l2oo"
 )
 
 type l2ooVerifyWorker struct {

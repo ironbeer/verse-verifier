@@ -27,6 +27,7 @@ var (
 type Database struct {
 	db *gorm.DB
 
+	Signer   *SignerDatabase
 	Block    *BlockDatabase
 	Optimism *OptimismDatabase
 	OPStack  *OPStackDatabase
@@ -66,11 +67,13 @@ func (db *Database) Transaction(fn func(*Database) error) error {
 }
 
 func newDB(db *gorm.DB) *Database {
+	signer := &SignerDatabase{db: db}
 	return &Database{
 		db:       db,
+		Signer:   signer,
 		Block:    &BlockDatabase{db: db},
-		Optimism: &OptimismDatabase{db: db},
-		OPStack:  &OPStackDatabase{db: db},
+		Optimism: &OptimismDatabase{db: db, SignerDatabase: signer},
+		OPStack:  &OPStackDatabase{db: db, SignerDatabase: signer},
 	}
 }
 

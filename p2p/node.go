@@ -23,7 +23,7 @@ import (
 	"github.com/oasysgames/oasys-optimism-verifier/database"
 	"github.com/oasysgames/oasys-optimism-verifier/p2p/pb"
 	"github.com/oasysgames/oasys-optimism-verifier/util"
-	"github.com/oasysgames/oasys-optimism-verifier/verselayer"
+	"github.com/oasysgames/oasys-optimism-verifier/verifier"
 	"github.com/oklog/ulid/v2"
 	"google.golang.org/protobuf/proto"
 )
@@ -695,7 +695,7 @@ func verifySignature(hubLayerChainID *big.Int, sig *pb.OptimismSignature) (bool,
 		return false, fmt.Errorf("future ulid: %s, timestamp: %d", sig.Id, id.Time())
 	}
 
-	msg := verselayer.NewSccMessage(
+	msg := verifier.NewSccMessage(
 		hubLayerChainID,
 		common.BytesToAddress(sig.Scc),
 		new(big.Int).SetUint64(sig.BatchIndex),

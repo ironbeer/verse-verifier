@@ -1,4 +1,4 @@
-package hublayer
+package stakemanager
 
 import (
 	"context"
@@ -9,16 +9,28 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 )
 
-type ValidatorStakings struct {
-	sm    StakeManager
+type IStakeManager interface {
+	GetTotalStake(callOpts *bind.CallOpts, epoch *big.Int) (*big.Int, error)
+
+	GetValidators(callOpts *bind.CallOpts, epoch, cursol, howMany *big.Int) (struct {
+		Owners     []common.Address
+		Operators  []common.Address
+		Stakes     []*big.Int
+		Candidates []bool
+		NewCursor  *big.Int
+	}, error)
+}
+
+type Cache struct {
+	sm    IStakeManager
 	cache *sync.Map
 }
 
-func NewValidatorStakings(sm StakeManager) *ValidatorStakings {
-	return &ValidatorStakings{sm: sm, cache: &sync.Map{}}
+func NewCache(sm IStakeManager) *Cache {
+	return &Cache{sm: sm, cache: &sync.Map{}}
 }
 
-func (vs *ValidatorStakings) Refresh(ctx context.Context) error {
+func (vs *Cache) Refresh(ctx context.Context) error {
 	// total amount
 	total, err := vs.sm.GetTotalStake(&bind.CallOpts{Context: ctx}, common.Big0)
 	if err != nil {
@@ -47,7 +59,7 @@ func (vs *ValidatorStakings) Refresh(ctx context.Context) error {
 	return nil
 }
 
-func (vs *ValidatorStakings) TotalStake() *big.Int {
+func (vs *Cache) TotalStake() *big.Int {
 	if val, ok := vs.cache.Load(common.Address{}); !ok {
 		return big.NewInt(0)
 	} else {
@@ -55,23 +67,11 @@ func (vs *ValidatorStakings) TotalStake() *big.Int {
 	}
 }
 
-func (vs ValidatorStakings) StakeBySigner(signer common.Address) *big.Int {
+func (vs Cache) StakeBySigner(signer common.Address) *big.Int {
 	if signer != (common.Address{}) {
 		if val, ok := vs.cache.Load(signer); ok {
 			return val.(*big.Int)
 		}
 	}
 	return big.NewInt(0)
-}
-
-type StakeManager interface {
-	GetTotalStake(callOpts *bind.CallOpts, epoch *big.Int) (*big.Int, error)
-
-	GetValidators(callOpts *bind.CallOpts, epoch, cursol, howMany *big.Int) (struct {
-		Owners     []common.Address
-		Operators  []common.Address
-		Stakes     []*big.Int
-		Candidates []bool
-		NewCursor  *big.Int
-	}, error)
 }

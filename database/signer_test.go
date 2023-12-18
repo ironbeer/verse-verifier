@@ -4,7 +4,6 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/suite"
-	"gorm.io/gorm"
 )
 
 func TestSignerDatabase(t *testing.T) {
@@ -14,12 +13,12 @@ func TestSignerDatabase(t *testing.T) {
 type SignerDatabaseTestSuite struct {
 	DatabaseTestSuite
 
-	db *gorm.DB
+	db *SignerDatabase
 }
 
 func (s *SignerDatabaseTestSuite) SetupTest() {
 	s.DatabaseTestSuite.SetupTest()
-	s.db = s.DatabaseTestSuite.rawdb
+	s.db = s.DatabaseTestSuite.db.Signer
 }
 
 func (s *SignerDatabaseTestSuite) TestFindOrCreateSigner() {
@@ -40,13 +39,13 @@ func (s *SignerDatabaseTestSuite) TestFindOrCreateSigner() {
 	addr2 := s.ItoAddress(2)
 	addr3 := s.ItoAddress(3)
 
-	got1, _ := findOrCreateSigner(s.db, addr1)
-	got2, _ := findOrCreateSigner(s.db, addr2)
-	got3, _ := findOrCreateSigner(s.db, addr3)
+	got1, _ := s.db.FindOrCreateSigner(addr1)
+	got2, _ := s.db.FindOrCreateSigner(addr2)
+	got3, _ := s.db.FindOrCreateSigner(addr3)
 	assert(got1, got2, got3)
 
-	got1, _ = findOrCreateSigner(s.db, addr1)
-	got2, _ = findOrCreateSigner(s.db, addr2)
-	got3, _ = findOrCreateSigner(s.db, addr3)
+	got1, _ = s.db.FindOrCreateSigner(addr1)
+	got2, _ = s.db.FindOrCreateSigner(addr2)
+	got3, _ = s.db.FindOrCreateSigner(addr3)
 	assert(got1, got2, got3)
 }

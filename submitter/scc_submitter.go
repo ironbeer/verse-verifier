@@ -1,4 +1,4 @@
-package hublayer
+package submitter
 
 import (
 	"bytes"
@@ -18,12 +18,13 @@ import (
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/oasysgames/oasys-optimism-verifier/config"
+	"github.com/oasysgames/oasys-optimism-verifier/contract/l2oo"
+	"github.com/oasysgames/oasys-optimism-verifier/contract/multicall2"
+	"github.com/oasysgames/oasys-optimism-verifier/contract/scc"
+	"github.com/oasysgames/oasys-optimism-verifier/contract/sccverifier"
+	"github.com/oasysgames/oasys-optimism-verifier/contract/stakemanager"
 	"github.com/oasysgames/oasys-optimism-verifier/database"
 	"github.com/oasysgames/oasys-optimism-verifier/ethutil"
-	"github.com/oasysgames/oasys-optimism-verifier/hublayer/contracts/l2oo"
-	"github.com/oasysgames/oasys-optimism-verifier/hublayer/contracts/multicall2"
-	"github.com/oasysgames/oasys-optimism-verifier/hublayer/contracts/scc"
-	"github.com/oasysgames/oasys-optimism-verifier/hublayer/contracts/sccverifier"
 	"github.com/oasysgames/oasys-optimism-verifier/util"
 	"golang.org/x/net/context"
 )
@@ -64,20 +65,20 @@ func init() {
 }
 
 type Submitter struct {
-	cfg   *config.Submitter
-	db    *database.Database
-	vs    *ValidatorStakings
-	tasks *sync.Map
-	log   log.Logger
+	cfg        *config.Submitter
+	db         *database.Database
+	stakeCache *stakemanager.Cache
+	tasks      *sync.Map
+	log        log.Logger
 }
 
-func NewSubmitter(cfg *config.Submitter, db *database.Database, sm StakeManager) *Submitter {
+func NewSubmitter(cfg *config.Submitter, db *database.Database, sm stakemanager.IStakeManager) *Submitter {
 	return &Submitter{
-		cfg:   cfg,
-		db:    db,
-		vs:    NewValidatorStakings(sm),
-		tasks: &sync.Map{},
-		log:   log.New("worker", "scc-submitter"),
+		cfg:        cfg,
+		db:         db,
+		stakeCache: stakemanager.NewCache(sm),
+		tasks:      &sync.Map{},
+		log:        log.New("worker", "scc-submitter"),
 	}
 }
 
@@ -119,7 +120,7 @@ func (w *Submitter) stakeRefreshLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-tick.C:
-			if err := w.vs.Refresh(ctx); err != nil {
+			if err := w.stakeCache.Refresh(ctx); err != nil {
 				w.log.Error("Failed to refresh stakes", "err", err)
 			}
 		}
@@ -216,7 +217,7 @@ func (w *Submitter) consumeIterator(ctx context.Context, it multicallIterator) (
 		}
 
 		topStakingSigs, first, err := getTopStakingSignatures(
-			sigs, minStake, w.vs.TotalStake(), w.vs.StakeBySigner)
+			sigs, minStake, w.stakeCache.TotalStake(), w.stakeCache.StakeBySigner)
 		if err != nil {
 			return nil, err
 		}

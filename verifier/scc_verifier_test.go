@@ -1,4 +1,4 @@
-package verselayer
+package verifier
 
 import (
 	"context"
@@ -14,12 +14,13 @@ import (
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/oasysgames/oasys-optimism-verifier/config"
+	"github.com/oasysgames/oasys-optimism-verifier/contract/scc"
 	"github.com/oasysgames/oasys-optimism-verifier/database"
-	"github.com/oasysgames/oasys-optimism-verifier/hublayer/contracts/scc"
 	"github.com/oasysgames/oasys-optimism-verifier/testhelper"
 	"github.com/oasysgames/oasys-optimism-verifier/util"
 	"github.com/stretchr/testify/suite"
 
+	"github.com/oasysgames/oasys-optimism-verifier/testhelper/backend"
 	tscc "github.com/oasysgames/oasys-optimism-verifier/testhelper/contracts/scc"
 )
 
@@ -27,8 +28,8 @@ type SccVerifierTestSuite struct {
 	testhelper.Suite
 
 	db    *database.Database
-	hub   *testhelper.TestBackend
-	verse *testhelper.TestBackend
+	hub   *backend.TestBackend
+	verse *backend.TestBackend
 
 	scc     *tscc.Scc
 	sccAddr common.Address
@@ -43,8 +44,8 @@ func TestSccVerifier(t *testing.T) {
 func (s *SccVerifierTestSuite) SetupTest() {
 	// setup test env
 	s.db, _ = database.NewDatabase(&config.Database{Path: ":memory:"})
-	s.hub = testhelper.NewTestBackend()
-	s.verse = testhelper.NewTestBackend()
+	s.hub = backend.NewTestBackend()
+	s.verse = backend.NewTestBackend()
 
 	// deploy `StateCommitmentChain` contract
 	s.sccAddr, _, s.scc, _ = tscc.DeployScc(s.hub.TransactOpts(context.Background()), s.hub)

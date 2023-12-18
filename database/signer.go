@@ -6,9 +6,13 @@ import (
 	"gorm.io/gorm/clause"
 )
 
-func findOrCreateSigner(db *gorm.DB, signer common.Address) (*Signer, error) {
+type SignerDatabase struct {
+	db *gorm.DB
+}
+
+func (db *SignerDatabase) FindOrCreateSigner(signer common.Address) (*Signer, error) {
 	row := &Signer{Address: signer}
-	tx := db.Clauses(clause.OnConflict{
+	tx := db.db.Clauses(clause.OnConflict{
 		Columns: []clause.Column{{Name: "address"}},
 	}).Create(row)
 	if tx.Error != nil {

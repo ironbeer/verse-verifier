@@ -1,37 +1,53 @@
-package hublayer
+package collector
 
 import (
 	"context"
 	"math/big"
 	"testing"
+	"time"
 
+	"github.com/oasysgames/oasys-optimism-verifier/config"
 	"github.com/oasysgames/oasys-optimism-verifier/database"
+	"github.com/oasysgames/oasys-optimism-verifier/testhelper"
+	"github.com/oasysgames/oasys-optimism-verifier/testhelper/backend"
 	tc "github.com/oasysgames/oasys-optimism-verifier/testhelper/contracts/scc"
 	"github.com/stretchr/testify/suite"
 )
 
 type EventCollectorTestSuite struct {
-	SccTestSuite
+	testhelper.Suite
+	backend.BackendSuite
+
+	collector *EventCollector
 }
 
 func TestEventCollector(t *testing.T) {
 	suite.Run(t, new(EventCollectorTestSuite))
 }
 
+func (s *EventCollectorTestSuite) SetupTest() {
+	s.BackendSuite.SetupTest()
+
+	s.collector = NewEventCollector(&config.Verifier{
+		Interval:         time.Millisecond,
+		EventFilterLimit: 1000,
+	}, s.DB, s.Hub, s.Hub.Signer())
+}
+
 func (s *EventCollectorTestSuite) TestProcessStateBatchAppendedEvent() {
 	// emit `StateBatchAppended` events
 	var emits []*tc.SccStateBatchAppended
 	for i := range s.Range(0, 10) {
-		emits = append(emits, s.emitStateBatchAppendedEvent(i))
+		emits = append(emits, s.EmitStateBatchAppendedEvent(i))
 	}
 
 	// collect `StateBatchAppended` events
-	s.stateCollector.work(context.Background())
+	s.collector.work(context.Background())
 
 	// assert
 	for i := range s.Range(0, 10) {
-		got, _ := s.db.Optimism.FindState(s.sccAddr, uint64(i))
-		s.Equal(s.sccAddr, got.OptimismScc.Address)
+		got, _ := s.DB.Optimism.FindState(s.SCCAddr, uint64(i))
+		s.Equal(s.SCCAddr, got.OptimismScc.Address)
 		s.Equal(emits[i].BatchIndex.Uint64(), got.BatchIndex)
 		s.Equal(emits[i].BatchRoot[:], got.BatchRoot[:])
 		s.Equal(emits[i].BatchSize.Uint64(), got.BatchSize)
@@ -46,19 +62,19 @@ func (s *EventCollectorTestSuite) TestProcessStateBatchDeletedEvent() {
 	// emit `StateBatchAppended` events
 	var emits []*tc.SccStateBatchAppended
 	for i := range s.Range(0, 10) {
-		emits = append(emits, s.emitStateBatchAppendedEvent(i))
+		emits = append(emits, s.EmitStateBatchAppendedEvent(i))
 	}
 
 	// collect `StateBatchAppended` events
-	s.stateCollector.work(ctx)
+	s.collector.work(ctx)
 
 	// create signature records
 	var creates []*database.OptimismSignature
 	for i := range s.Range(0, 10) {
-		sig, _ := s.db.Optimism.SaveSignature(
+		sig, _ := s.DB.Optimism.SaveSignature(
 			nil, nil,
-			s.hub.Signer(),
-			s.sccAddr,
+			s.Hub.Signer(),
+			s.SCCAddr,
 			emits[i].BatchIndex.Uint64(),
 			emits[i].BatchRoot,
 			0,
@@ -71,15 +87,15 @@ func (s *EventCollectorTestSuite) TestProcessStateBatchDeletedEvent() {
 	}
 
 	// emit `StateBatchDeleted` event
-	s.tscc.EmitStateBatchDeleted(
-		s.hub.TransactOpts(ctx),
+	s.TSCC.EmitStateBatchDeleted(
+		s.Hub.TransactOpts(ctx),
 		emits[5].BatchIndex,
 		emits[5].BatchRoot,
 	)
-	s.mining()
+	s.Mining()
 
 	// collect `StateBatchDeleted` events
-	s.stateCollector.work(ctx)
+	s.collector.work(ctx)
 
 	// assert
 	for i := range s.Range(0, 10) {
@@ -87,8 +103,8 @@ func (s *EventCollectorTestSuite) TestProcessStateBatchDeletedEvent() {
 		if i >= 5 {
 			want = database.ErrNotFound
 		}
-		_, err0 := s.db.Optimism.FindState(s.sccAddr, uint64(i))
-		_, err1 := s.db.Optimism.FindSignatureByID(creates[i].ID)
+		_, err0 := s.DB.Optimism.FindState(s.SCCAddr, uint64(i))
+		_, err1 := s.DB.Optimism.FindSignatureByID(creates[i].ID)
 		s.Equal(want, err0)
 		s.Equal(want, err1)
 	}
@@ -97,19 +113,19 @@ func (s *EventCollectorTestSuite) TestProcessStateBatchDeletedEvent() {
 func (s *EventCollectorTestSuite) TestProcessStateBatchVerifiedEvent() {
 	// emit `EmitStateBatchVerified` events
 	for index := range s.Range(0, 5) {
-		s.tscc.EmitStateBatchVerified(
-			s.hub.TransactOpts(context.Background()),
+		s.TSCC.EmitStateBatchVerified(
+			s.Hub.TransactOpts(context.Background()),
 			big.NewInt(int64(index)),
 			s.RandHash(),
 		)
-		s.mining()
+		s.Mining()
 	}
 
 	// collect `EmitStateBatchVerified` events
-	s.stateCollector.work(context.Background())
+	s.collector.work(context.Background())
 
 	// assert
-	scc, _ := s.db.Optimism.FindOrCreateSCC(s.sccAddr)
+	scc, _ := s.DB.Optimism.FindOrCreateSCC(s.SCCAddr)
 	s.Equal(uint64(5), scc.NextIndex)
 }
 
@@ -118,13 +134,13 @@ func (s *EventCollectorTestSuite) TestNoHandleOtherEvent() {
 
 	// emit `StateBatchAppended` and `Other` events
 	for i := range s.Range(0, 10) {
-		s.emitStateBatchAppendedEvent(i)
-		s.tscc.EmitOtherEvent(s.hub.TransactOpts(ctx), big.NewInt(11))
-		s.mining()
+		s.EmitStateBatchAppendedEvent(i)
+		s.TSCC.EmitOtherEvent(s.Hub.TransactOpts(ctx), big.NewInt(11))
+		s.Mining()
 	}
 
 	// collect `StateBatchAppended` events
-	s.stateCollector.work(ctx)
+	s.collector.work(ctx)
 
 	// assert
 	for i := range s.Range(0, 20) {
@@ -132,7 +148,7 @@ func (s *EventCollectorTestSuite) TestNoHandleOtherEvent() {
 		if i >= 10 {
 			want = database.ErrNotFound
 		}
-		_, err := s.db.Optimism.FindState(s.sccAddr, uint64(i))
+		_, err := s.DB.Optimism.FindState(s.SCCAddr, uint64(i))
 		s.ErrorIs(err, want)
 	}
 }
@@ -143,19 +159,19 @@ func (s *EventCollectorTestSuite) TestHandleReorganization() {
 	// emit `StateBatchAppended` events
 	var emits []*tc.SccStateBatchAppended
 	for i := range s.Range(0, 10) {
-		emits = append(emits, s.emitStateBatchAppendedEvent(i))
+		emits = append(emits, s.EmitStateBatchAppendedEvent(i))
 	}
 
 	// collect `StateBatchAppended` events
-	s.stateCollector.work(ctx)
+	s.collector.work(ctx)
 
 	// create signature records
 	var creates []*database.OptimismSignature
 	for i := range s.Range(0, 10) {
-		sig, _ := s.db.Optimism.SaveSignature(
+		sig, _ := s.DB.Optimism.SaveSignature(
 			nil, nil,
-			s.hub.Signer(),
-			s.sccAddr,
+			s.Hub.Signer(),
+			s.SCCAddr,
 			emits[i].BatchIndex.Uint64(),
 			emits[i].BatchRoot,
 			emits[i].BatchSize.Uint64(),
@@ -168,19 +184,19 @@ func (s *EventCollectorTestSuite) TestHandleReorganization() {
 	}
 
 	// simulate chain reorganization
-	s.emitStateBatchAppendedEvent(4)
-	s.stateCollector.work(ctx)
+	s.EmitStateBatchAppendedEvent(4)
+	s.collector.work(ctx)
 
 	// assert
 	for i := range s.Range(0, 10) {
-		_, err := s.db.Optimism.FindState(s.sccAddr, uint64(i))
+		_, err := s.DB.Optimism.FindState(s.SCCAddr, uint64(i))
 		if i < 5 {
 			s.NoError(err)
 		} else {
 			s.Error(err, database.ErrNotFound)
 		}
 
-		_, err = s.db.Optimism.FindSignatureByID(creates[i].ID)
+		_, err = s.DB.Optimism.FindSignatureByID(creates[i].ID)
 		if i < 4 {
 			s.NoError(err)
 		} else {

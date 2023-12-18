@@ -1,4 +1,4 @@
-package hublayer
+package stakemanager
 
 import (
 	"context"
@@ -7,23 +7,24 @@ import (
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/oasysgames/oasys-optimism-verifier/testhelper"
+	"github.com/oasysgames/oasys-optimism-verifier/testhelper/backend"
 	"github.com/stretchr/testify/suite"
 )
 
-type ValidatorStakingsTestSuite struct {
+type CacheTestSuite struct {
 	testhelper.Suite
 
-	sm *stakeManagerMock
-	vs *ValidatorStakings
+	sm *backend.StakeManagerMock
+	vs *Cache
 }
 
-func TestValidatorStakings(t *testing.T) {
-	suite.Run(t, new(ValidatorStakingsTestSuite))
+func TestNewCache(t *testing.T) {
+	suite.Run(t, new(CacheTestSuite))
 }
 
-func (s *ValidatorStakingsTestSuite) SetupTest() {
-	s.sm = &stakeManagerMock{}
-	s.vs = NewValidatorStakings(s.sm)
+func (s *CacheTestSuite) SetupTest() {
+	s.sm = &backend.StakeManagerMock{}
+	s.vs = NewCache(s.sm)
 
 	for i := range s.Range(0, 1000) {
 		s.sm.Owners = append(s.sm.Owners, s.RandAddress())
@@ -34,7 +35,7 @@ func (s *ValidatorStakingsTestSuite) SetupTest() {
 	}
 }
 
-func (s *ValidatorStakingsTestSuite) TestRefresh() {
+func (s *CacheTestSuite) TestRefresh() {
 	s.Equal(common.Big0, s.vs.TotalStake())
 	for _, signer := range s.sm.Operators {
 		s.Equal(common.Big0, s.vs.StakeBySigner(signer))

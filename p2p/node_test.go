@@ -18,8 +18,9 @@ import (
 	"github.com/oasysgames/oasys-optimism-verifier/database"
 	"github.com/oasysgames/oasys-optimism-verifier/p2p/pb"
 	"github.com/oasysgames/oasys-optimism-verifier/testhelper"
+	"github.com/oasysgames/oasys-optimism-verifier/testhelper/backend"
 	"github.com/oasysgames/oasys-optimism-verifier/util"
-	"github.com/oasysgames/oasys-optimism-verifier/verselayer"
+	"github.com/oasysgames/oasys-optimism-verifier/verifier"
 	"github.com/oklog/ulid/v2"
 	"github.com/stretchr/testify/suite"
 )
@@ -32,9 +33,9 @@ type NodeTestSuite struct {
 	testhelper.Suite
 
 	baseTime time.Time
-	b0       *testhelper.TestBackend
-	b1       *testhelper.TestBackend
-	b2       *testhelper.TestBackend
+	b0       *backend.TestBackend
+	b1       *backend.TestBackend
+	b2       *backend.TestBackend
 	signer0  common.Address
 	signer1  common.Address
 	signer2  common.Address
@@ -50,7 +51,7 @@ type NodeTestSuite struct {
 
 func (s *NodeTestSuite) SetupTest() {
 	s.baseTime = time.Now().UTC()
-	s.b0 = testhelper.NewTestBackend()
+	s.b0 = backend.NewTestBackend()
 	s.b1 = s.b0.NewAccountBackend()
 	s.b2 = s.b0.NewAccountBackend()
 	s.signer0 = s.b0.Signer()
@@ -77,15 +78,15 @@ func (s *NodeTestSuite) SetupTest() {
 
 	// create sample records
 	for _, node := range []*Node{s.node1, s.node2} {
-		node.db.Optimism.FindOrCreateSigner(s.signer0)
-		node.db.Optimism.FindOrCreateSigner(s.signer1)
-		node.db.Optimism.FindOrCreateSigner(s.signer2)
+		node.db.Signer.FindOrCreateSigner(s.signer0)
+		node.db.Signer.FindOrCreateSigner(s.signer1)
+		node.db.Signer.FindOrCreateSigner(s.signer2)
 		node.db.Optimism.FindOrCreateSCC(s.scc0)
 		node.db.Optimism.FindOrCreateSCC(s.scc1)
 		node.db.Optimism.FindOrCreateSCC(s.scc2)
 	}
 
-	backends := []*testhelper.TestBackend{s.b0, s.b1, s.b2}
+	backends := []*backend.TestBackend{s.b0, s.b1, s.b2}
 	signers := []common.Address{s.signer0, s.signer1}
 	sccs := []common.Address{s.scc0, s.scc1}
 	sizes := [][]int{{50, 100}, {150, 200}}
@@ -101,7 +102,7 @@ func (s *NodeTestSuite) SetupTest() {
 				batchRoot := s.genStateRoot(scc[:], index)
 				approved := true
 
-				msg := verselayer.NewSccMessage(
+				msg := verifier.NewSccMessage(
 					backend.ChainID(),
 					scc,
 					big.NewInt(int64(index)),
@@ -164,7 +165,7 @@ func (s *NodeTestSuite) TestHandleOptimismSignatureExchangeFromPubSub() {
 	}
 
 	lastcase := cases[len(cases)-1]
-	msg := verselayer.NewSccMessage(
+	msg := verifier.NewSccMessage(
 		s.b2.ChainID(),
 		common.BytesToAddress(lastcase.msg.Scc),
 		new(big.Int).SetUint64(lastcase.msg.BatchIndex),
@@ -341,7 +342,7 @@ func (s *NodeTestSuite) TestHandleOptimismSignatureExchangeRequests() {
 
 func (s *NodeTestSuite) TestHandleOptimismSignatureExchangeResponses() {
 	cases := []struct {
-		b    *testhelper.TestBackend
+		b    *backend.TestBackend
 		want *pb.OptimismSignature
 	}{
 		{
@@ -421,7 +422,7 @@ func (s *NodeTestSuite) TestHandleOptimismSignatureExchangeResponses() {
 	// send message
 	responses := []*pb.OptimismSignature{}
 	for _, tt := range cases {
-		m := verselayer.NewSccMessage(
+		m := verifier.NewSccMessage(
 			tt.b.ChainID(),
 			common.BytesToAddress(tt.want.Scc),
 			new(big.Int).SetUint64(tt.want.BatchIndex),

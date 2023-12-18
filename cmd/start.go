@@ -20,17 +20,18 @@ import (
 	"github.com/libp2p/go-libp2p-core/crypto"
 	"github.com/oasysgames/oasys-optimism-verifier/beacon"
 	"github.com/oasysgames/oasys-optimism-verifier/cmd/ipccmd"
+	"github.com/oasysgames/oasys-optimism-verifier/collector"
 	"github.com/oasysgames/oasys-optimism-verifier/config"
+	"github.com/oasysgames/oasys-optimism-verifier/contract/l2oo"
+	"github.com/oasysgames/oasys-optimism-verifier/contract/scc"
+	"github.com/oasysgames/oasys-optimism-verifier/contract/stakemanager"
 	"github.com/oasysgames/oasys-optimism-verifier/database"
 	"github.com/oasysgames/oasys-optimism-verifier/ethutil"
-	"github.com/oasysgames/oasys-optimism-verifier/hublayer"
-	"github.com/oasysgames/oasys-optimism-verifier/hublayer/contracts/l2oo"
-	"github.com/oasysgames/oasys-optimism-verifier/hublayer/contracts/scc"
-	"github.com/oasysgames/oasys-optimism-verifier/hublayer/contracts/stakemanager"
 	"github.com/oasysgames/oasys-optimism-verifier/ipc"
 	"github.com/oasysgames/oasys-optimism-verifier/p2p"
+	submitterpkg "github.com/oasysgames/oasys-optimism-verifier/submitter"
 	"github.com/oasysgames/oasys-optimism-verifier/util"
-	"github.com/oasysgames/oasys-optimism-verifier/verselayer"
+	verifierpkg "github.com/oasysgames/oasys-optimism-verifier/verifier"
 	"github.com/oasysgames/oasys-optimism-verifier/version"
 	"github.com/oasysgames/oasys-optimism-verifier/wallet"
 	"github.com/spf13/cobra"
@@ -294,7 +295,7 @@ func newP2P(
 	ctx context.Context,
 	c *config.Config,
 	db *database.Database,
-	verifier *verselayer.Verifier,
+	verifier *verifierpkg.Verifier,
 ) *p2p.Node {
 	// get p2p private key
 	p2pKey, err := getOrCreateP2PKey(c.P2PKeyPath())
@@ -347,12 +348,12 @@ func newBlockCollector(
 	c *config.Config,
 	db *database.Database,
 	hub ethutil.ReadOnlyClient,
-) *hublayer.BlockCollector {
+) *collector.BlockCollector {
 	if !c.Verifier.Enable {
 		return nil
 	}
 
-	return hublayer.NewBlockCollector(&c.Verifier, db, hub)
+	return collector.NewBlockCollector(&c.Verifier, db, hub)
 }
 
 func newEventCollector(
@@ -360,22 +361,22 @@ func newEventCollector(
 	c *config.Config,
 	db *database.Database,
 	hub ethutil.ReadOnlyClient,
-) *hublayer.EventCollector {
+) *collector.EventCollector {
 	if !c.Verifier.Enable {
 		return nil
 	}
 
-	return hublayer.NewEventCollector(
+	return collector.NewEventCollector(
 		&c.Verifier, db, hub,
 		common.HexToAddress(c.Wallets[c.Verifier.Wallet].Address),
 	)
 }
 
-func newVerifier(c *config.Config, db *database.Database, l1Client ethutil.WritableClient) *verselayer.Verifier {
+func newVerifier(c *config.Config, db *database.Database, l1Client ethutil.WritableClient) *verifierpkg.Verifier {
 	if !c.Verifier.Enable {
 		return nil
 	}
-	return verselayer.NewVerifier(&c.Verifier, db, l1Client.SignerContext())
+	return verifierpkg.NewVerifier(&c.Verifier, db, l1Client.SignerContext())
 }
 
 func newSubmitter(
@@ -384,7 +385,7 @@ func newSubmitter(
 	ks *wallet.KeyStore,
 	db *database.Database,
 	hub ethutil.ReadOnlyClient,
-) *hublayer.Submitter {
+) *submitterpkg.Submitter {
 	if !c.Submitter.Enable {
 		return nil
 	}
@@ -394,7 +395,7 @@ func newSubmitter(
 		log.Crit("Failed to create StakeManager", "err", err)
 	}
 
-	return hublayer.NewSubmitter(&c.Submitter, db, sm)
+	return submitterpkg.NewSubmitter(&c.Submitter, db, sm)
 }
 
 func startVerseDiscovery(
@@ -402,8 +403,8 @@ func startVerseDiscovery(
 	c *config.Config,
 	ks *wallet.KeyStore,
 	l1Client ethutil.ReadOnlyClient,
-	verifier *verselayer.Verifier,
-	submitter *hublayer.Submitter,
+	verifier *verifierpkg.Verifier,
+	submitter *submitterpkg.Submitter,
 ) {
 	if !c.Verifier.Enable && !c.Submitter.Enable {
 		return
@@ -459,10 +460,10 @@ func startVerseDiscovery(
 						}
 
 						if scc_ != nil {
-							verifier.AddWorker(verselayer.NewSccVerifyWorker(l2Client, sccAddr, scc_))
+							verifier.AddWorker(verifierpkg.NewSccVerifyWorker(l2Client, sccAddr, scc_))
 						}
 						if l2oo_ != nil {
-							verifier.AddWorker(verselayer.NewL2OOVerifyWorker(l2Client, l2ooAddr, l2oo_))
+							verifier.AddWorker(verifierpkg.NewL2OOVerifyWorker(l2Client, l2ooAddr, l2oo_))
 						}
 					}
 
@@ -486,10 +487,10 @@ func startVerseDiscovery(
 							}
 
 							if scc_ != nil {
-								submitter.AddTask(hublayer.NewSccSubmitTask(l1Client, sccAddr, scc_))
+								submitter.AddTask(submitterpkg.NewSccSubmitTask(l1Client, sccAddr, scc_))
 							}
 							if l2oo_ != nil {
-								submitter.AddTask(hublayer.NewL2OOSubmitTask(l1Client, l2ooAddr, l2oo_))
+								submitter.AddTask(submitterpkg.NewL2OOSubmitTask(l1Client, l2ooAddr, l2oo_))
 							}
 
 							break
@@ -537,7 +538,7 @@ func startVerifier(
 	c *config.Config,
 	db *database.Database,
 	l1Client ethutil.WritableClient,
-	verifier *verselayer.Verifier,
+	verifier *verifierpkg.Verifier,
 	p2p *p2p.Node,
 ) {
 	wg := &sync.WaitGroup{}

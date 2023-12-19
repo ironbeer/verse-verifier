@@ -118,7 +118,7 @@ func (w *l2ooVerifyWorker) verifyProposal(
 	approved := bytes.Equal(proposal.OutputRoot[:], output.OutputRoot().Bytes())
 
 	// calc and save signature
-	msg := NewOpstackMessage(
+	msg := NewL2ooMessage(
 		wc.signer.ChainID,
 		proposal.OpstackL2OutputOracle.Address,
 		new(big.Int).SetUint64(proposal.L2OutputIndex),
@@ -148,7 +148,7 @@ func (w *l2ooVerifyWorker) deleteInvalidSignature(wc *verifyWorkerContext, nextV
 		return
 	}
 
-	msg := NewOpstackMessage(
+	msg := NewL2ooMessage(
 		wc.signer.ChainID,
 		sigs[0].OpstackL2OutputOracle.Address,
 		new(big.Int).SetUint64(sigs[0].L2OutputIndex),

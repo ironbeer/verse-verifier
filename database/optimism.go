@@ -400,16 +400,6 @@ func (db *OptimismDatabase) DeleteSignatures(
 	return affected, nil
 }
 
-func (db *OptimismDatabase) signerIdSub(signer common.Address) (*gorm.DB, error) {
-	sub := db.db.Model(&Signer{}).
-		Select("id").
-		Where("address = ?", signer)
-	if sub.Error != nil {
-		return nil, sub.Error
-	}
-	return sub, nil
-}
-
 func (db *OptimismDatabase) sccIdSub(scc common.Address) (*gorm.DB, error) {
 	sub := db.db.Model(&OptimismScc{}).
 		Select("id").

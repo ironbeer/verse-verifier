@@ -57,8 +57,8 @@ func (db *OPStackDatabase) FindProposal(
 	var row OpstackProposal
 	tx := db.db.
 		Joins("OpstackL2OutputOracle").
-		Where("optimism_states.opstack_l2_output_oracle_id = (?)", sub).
-		Where("optimism_states.l2_output_index = ?", l2OutputIndex).
+		Where("opstack_proposals.opstack_l2_output_oracle_id = (?)", sub).
+		Where("opstack_proposals.l2_output_index = ?", l2OutputIndex).
 		First(&row)
 
 	if err := errconv(tx.Error); err != nil {
@@ -395,16 +395,6 @@ func (db *OPStackDatabase) DeleteSignatures(
 	}
 
 	return affected, nil
-}
-
-func (db *OPStackDatabase) signerIdSub(signer common.Address) (*gorm.DB, error) {
-	sub := db.db.Model(&Signer{}).
-		Select("id").
-		Where("address = ?", signer)
-	if sub.Error != nil {
-		return nil, sub.Error
-	}
-	return sub, nil
 }
 
 func (db *OPStackDatabase) l2ooIdSub(l2oo common.Address) (*gorm.DB, error) {

@@ -5,6 +5,7 @@ set -eu
 TARGETS="
 multicall2:contracts/Multicall2.sol
 scc:contracts/OasysStateCommitmentChain.sol
+l2oo:contracts/OasysL2OutputOracle.sol
 sccverifier:contracts/OasysStateCommitmentChainVerifier.sol
 "
 

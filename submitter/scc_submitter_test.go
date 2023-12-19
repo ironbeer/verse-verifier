@@ -15,13 +15,11 @@ import (
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/oasysgames/oasys-optimism-verifier/config"
 	"github.com/oasysgames/oasys-optimism-verifier/database"
-	"github.com/oasysgames/oasys-optimism-verifier/testhelper"
 	"github.com/oasysgames/oasys-optimism-verifier/testhelper/backend"
 	"github.com/stretchr/testify/suite"
 )
 
 type SubmitterTestSuite struct {
-	testhelper.Suite
 	backend.BackendSuite
 
 	submitter *Submitter

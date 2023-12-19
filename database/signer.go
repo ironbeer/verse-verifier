@@ -20,3 +20,13 @@ func (db *SignerDatabase) FindOrCreateSigner(signer common.Address) (*Signer, er
 	}
 	return row, nil
 }
+
+func (db *SignerDatabase) signerIdSub(signer common.Address) (*gorm.DB, error) {
+	sub := db.db.Model(&Signer{}).
+		Select("id").
+		Where("address = ?", signer)
+	if sub.Error != nil {
+		return nil, sub.Error
+	}
+	return sub, nil
+}

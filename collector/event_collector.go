@@ -77,9 +77,9 @@ func init() {
 			},
 			&logProcessor{
 				abi:          &parsed,
-				name:         "L2OutputVerified",
-				log2event:    func(log types.Log) interface{} { return &l2oo.OasysL2OutputOracleL2OutputVerified{Raw: log} },
-				eventHandler: handleL2OutputVerifiedEvent,
+				name:         "OutputVerified",
+				log2event:    func(log types.Log) interface{} { return &l2oo.OasysL2OutputOracleOutputVerified{Raw: log} },
+				eventHandler: handleOutputVerifiedEvent,
 			})
 	}
 
@@ -391,8 +391,8 @@ func handleOutputsDeletedEvent(w *EventCollector, tx *database.Database, event i
 	return nil
 }
 
-func handleL2OutputVerifiedEvent(w *EventCollector, tx *database.Database, event interface{}) error {
-	e, ok := event.(*l2oo.OasysL2OutputOracleL2OutputVerified)
+func handleOutputVerifiedEvent(w *EventCollector, tx *database.Database, event interface{}) error {
+	e, ok := event.(*l2oo.OasysL2OutputOracleOutputVerified)
 	if !ok {
 		return fmt.Errorf("event type mismatch(%v)", event)
 	}
@@ -401,10 +401,10 @@ func handleL2OutputVerifiedEvent(w *EventCollector, tx *database.Database, event
 
 	logCtx := []interface{}{
 		"block", e.Raw.BlockNumber,
-		"scc", e.Raw.Address.Hex(),
+		"l2oo", e.Raw.Address.Hex(),
 		"next-verify-index", nextVerifyIndex,
 	}
-	w.log.Info("New L2OO.L2OutputVerified event", logCtx...)
+	w.log.Info("New L2OO.OutputVerified event", logCtx...)
 
 	if err := tx.OPStack.SaveNextVerifyIndex(e.Raw.Address, nextVerifyIndex); err != nil {
 		w.log.Error("Failed to save next index", append(logCtx, "err", err)...)

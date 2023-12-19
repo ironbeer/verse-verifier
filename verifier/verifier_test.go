@@ -24,7 +24,7 @@ import (
 	tscc "github.com/oasysgames/oasys-optimism-verifier/testhelper/contracts/scc"
 )
 
-type SccVerifierTestSuite struct {
+type VerifierTestSuite struct {
 	testhelper.Suite
 
 	db    *database.Database
@@ -37,11 +37,11 @@ type SccVerifierTestSuite struct {
 	verifier *Verifier
 }
 
-func TestSccVerifier(t *testing.T) {
-	suite.Run(t, new(SccVerifierTestSuite))
+func TestVerifier(t *testing.T) {
+	suite.Run(t, new(VerifierTestSuite))
 }
 
-func (s *SccVerifierTestSuite) SetupTest() {
+func (s *VerifierTestSuite) SetupTest() {
 	// setup test env
 	s.db, _ = database.NewDatabase(&config.Database{Path: ":memory:"})
 	s.hub = backend.NewTestBackend()
@@ -61,7 +61,7 @@ func (s *SccVerifierTestSuite) SetupTest() {
 	s.verifier.AddWorker(NewSccVerifyWorker(s.verse, s.sccAddr, s.scc))
 }
 
-func (s *SccVerifierTestSuite) TestVerify() {
+func (s *VerifierTestSuite) TestVerify() {
 	cases := []struct {
 		batchRoot     string
 		wantSignature string
@@ -124,7 +124,7 @@ func (s *SccVerifierTestSuite) TestVerify() {
 	}
 }
 
-func (s *SccVerifierTestSuite) TestDeleteInvalidSignature() {
+func (s *VerifierTestSuite) TestDeleteInvalidSignature() {
 	batches := s.Range(0, 10)
 	batchSize := 5
 	invalidBatch := 6
@@ -216,7 +216,7 @@ func (s *SccVerifierTestSuite) TestDeleteInvalidSignature() {
 	}
 }
 
-func (s *SccVerifierTestSuite) TestCalcMerkleRoot() {
+func (s *VerifierTestSuite) TestCalcMerkleRoot() {
 	cases := []struct {
 		name string
 		spec func()
@@ -297,7 +297,7 @@ func (s *SccVerifierTestSuite) TestCalcMerkleRoot() {
 	}
 }
 
-func (s *SccVerifierTestSuite) sendTransaction(count int) (headers []*types.Header) {
+func (s *VerifierTestSuite) sendTransaction(count int) (headers []*types.Header) {
 	for i := 0; i < count; i++ {
 		signedTx, _ := s.hub.SignTx(types.NewTransaction(
 			uint64(i),
@@ -315,7 +315,7 @@ func (s *SccVerifierTestSuite) sendTransaction(count int) (headers []*types.Head
 	return headers
 }
 
-func (s *SccVerifierTestSuite) fillDefaultHashes(elements [][32]byte) [][32]byte {
+func (s *VerifierTestSuite) fillDefaultHashes(elements [][32]byte) [][32]byte {
 	fillhash := util.BytesToBytes32(
 		crypto.Keccak256(common.FromHex("0x" + strings.Repeat("00", 32))),
 	)
@@ -332,7 +332,7 @@ func (s *SccVerifierTestSuite) fillDefaultHashes(elements [][32]byte) [][32]byte
 	return filled
 }
 
-func (s *SccVerifierTestSuite) startAndWait(
+func (s *VerifierTestSuite) startAndWait(
 	verifier *Verifier,
 	count int,
 ) []*database.OptimismSignature {

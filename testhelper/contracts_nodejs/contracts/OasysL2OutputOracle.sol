@@ -44,4 +44,8 @@ contract OasysL2OutputOracle {
 
         emit OutputFailed(l2OutputIndex, outputRoot, l2BlockNumber);
     }
+
+    function setNextVerifyIndex(uint256 val) external {
+        nextVerifyIndex = val;
+    }
 }

@@ -165,7 +165,7 @@ func runStartCmd(cmd *cobra.Command, args []string) {
 				&conf.Beacon,
 				http.DefaultClient,
 				beacon.Beacon{
-					Signer:  verifier.Signer().Signer.String(),
+					Signer:  verifier.SignerContext().Signer.String(),
 					Version: version.SemVer(),
 					PeerID:  p2p.PeerID().String(),
 				},
@@ -332,7 +332,7 @@ func newP2P(
 	// ignore self-signed signatures
 	ignoreSigners := []common.Address{}
 	if verifier != nil {
-		ignoreSigners = append(ignoreSigners, verifier.Signer().Signer)
+		ignoreSigners = append(ignoreSigners, verifier.SignerContext().Signer)
 	}
 
 	node, err := p2p.NewNode(&c.P2P, db, host, dht, bwm, c.HubLayer.ChainId, ignoreSigners)

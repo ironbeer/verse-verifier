@@ -60,7 +60,7 @@ func (w *l2ooVerifyWorker) work(wc *verifyWorkerContext, ctx context.Context) {
 
 	for i := nextVerifyIndex.Uint64(); ; i++ {
 		proposals, err := wc.db.OPStack.FindVerificationWaitingProposals(
-			wc.signer.Signer, w.l2ooAddr, i, 1)
+			wc.signerCtx.Signer, w.l2ooAddr, i, 1)
 		if err != nil {
 			wc.log.Error("Failed to find proposals", "err", err)
 			return
@@ -80,7 +80,7 @@ func (w *l2ooVerifyWorker) work(wc *verifyWorkerContext, ctx context.Context) {
 
 		row, err := wc.db.OPStack.SaveSignature(
 			nil, nil,
-			wc.signer.Signer,
+			wc.signerCtx.Signer,
 			proposal.OpstackL2OutputOracle.Address,
 			proposal.L2OutputIndex,
 			proposal.OutputRoot,
@@ -108,9 +108,8 @@ func (w *l2ooVerifyWorker) verifyProposal(
 	}
 
 	// verify storage proof of L2ToL1MessagePasser
-	storageKeys := []string{}
 	output, err := ethutil.GetOpstackOutputV0(ctx, w.l2Client,
-		ethutil.OpstackPredeploys.L2ToL1MessagePasser, storageKeys, proposal.L2BlockNumber)
+		ethutil.OpstackPredeploys.L2ToL1MessagePasser, []string{}, proposal.L2BlockNumber)
 	if err != nil {
 		return false, database.Signature{}, err
 	}
@@ -119,7 +118,7 @@ func (w *l2ooVerifyWorker) verifyProposal(
 
 	// calc and save signature
 	msg := NewL2ooMessage(
-		wc.signer.ChainID,
+		wc.signerCtx.ChainID,
 		proposal.OpstackL2OutputOracle.Address,
 		new(big.Int).SetUint64(proposal.L2OutputIndex),
 		proposal.OutputRoot,
@@ -127,7 +126,7 @@ func (w *l2ooVerifyWorker) verifyProposal(
 		new(big.Int).SetUint64(proposal.L2BlockNumber),
 		approved,
 	)
-	if sig, err := msg.Signature(wc.signer.SignData); err == nil {
+	if sig, err := msg.Signature(wc.signerCtx.SignData); err == nil {
 		return approved, sig, nil
 	} else {
 		wc.log.Error("Failed to calculate signature", append(logCtx, "err", err)...)
@@ -138,8 +137,7 @@ func (w *l2ooVerifyWorker) verifyProposal(
 func (w *l2ooVerifyWorker) deleteInvalidSignature(wc *verifyWorkerContext, nextVerifyIndex uint64) {
 	logCtx := []interface{}{"next-verify-index", nextVerifyIndex}
 
-	signer := wc.signer.Signer
-	sigs, err := wc.db.OPStack.FindSignatures(nil, &signer, &w.l2ooAddr, &nextVerifyIndex, 1, 0)
+	sigs, err := wc.db.OPStack.FindSignatures(nil, &wc.signerCtx.Signer, &w.l2ooAddr, &nextVerifyIndex, 1, 0)
 	if err != nil {
 		wc.log.Error("Unable to find signatures", append(logCtx, "err", err)...)
 		return
@@ -149,14 +147,14 @@ func (w *l2ooVerifyWorker) deleteInvalidSignature(wc *verifyWorkerContext, nextV
 	}
 
 	msg := NewL2ooMessage(
-		wc.signer.ChainID,
+		wc.signerCtx.ChainID,
 		sigs[0].OpstackL2OutputOracle.Address,
 		new(big.Int).SetUint64(sigs[0].L2OutputIndex),
 		sigs[0].OutputRoot,
 		new(big.Int).SetUint64(sigs[0].L1Timestamp),
 		new(big.Int).SetUint64(sigs[0].L2BlockNumber),
 		sigs[0].Approved)
-	if match, err := msg.VerifySigner(sigs[0].Signature[:], signer); err == nil && match {
+	if match, err := msg.VerifySigner(sigs[0].Signature[:], wc.signerCtx.Signer); err == nil && match {
 		wc.log.Debug("No invalid signature", logCtx...)
 		return
 	} else if err != nil {
@@ -165,7 +163,7 @@ func (w *l2ooVerifyWorker) deleteInvalidSignature(wc *verifyWorkerContext, nextV
 
 	wc.log.Warn("Found invalid signature", append(logCtx, "signature", sigs[0].Signature.Hex())...)
 
-	if rows, err := wc.db.OPStack.DeleteSignatures(signer, w.l2ooAddr, nextVerifyIndex); err != nil {
+	if rows, err := wc.db.OPStack.DeleteSignatures(wc.signerCtx.Signer, w.l2ooAddr, nextVerifyIndex); err != nil {
 		wc.log.Error("Unable to delete signatures", append(logCtx, "err", err)...)
 	} else {
 		wc.log.Warn("Deleted invalid signature", append(logCtx, "delete-rows", rows)...)

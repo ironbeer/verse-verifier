@@ -13,11 +13,11 @@ import (
 )
 
 type verifyWorkerContext struct {
-	cfg    *config.Verifier
-	db     *database.Database
-	signer *ethutil.SignerContext
-	topic  *util.Topic
-	log    log.Logger
+	cfg       *config.Verifier
+	db        *database.Database
+	signerCtx *ethutil.SignerContext
+	topic     *util.Topic
+	log       log.Logger
 }
 
 type verifyWorker interface {
@@ -28,23 +28,23 @@ type verifyWorker interface {
 
 // Worker to verify the events of OasysStateCommitmentChain.
 type Verifier struct {
-	cfg     *config.Verifier
-	db      *database.Database
-	signer  *ethutil.SignerContext
-	topic   *util.Topic
-	workers *sync.Map
-	log     log.Logger
+	cfg       *config.Verifier
+	db        *database.Database
+	signerCtx *ethutil.SignerContext
+	topic     *util.Topic
+	workers   *sync.Map
+	log       log.Logger
 }
 
 // Returns the new verifier.
-func NewVerifier(cfg *config.Verifier, db *database.Database, signer *ethutil.SignerContext) *Verifier {
+func NewVerifier(cfg *config.Verifier, db *database.Database, signerCtx *ethutil.SignerContext) *Verifier {
 	return &Verifier{
-		cfg:     cfg,
-		db:      db,
-		signer:  signer,
-		topic:   util.NewTopic(),
-		workers: &sync.Map{},
-		log:     log.New("worker", "verifier"),
+		cfg:       cfg,
+		db:        db,
+		signerCtx: signerCtx,
+		topic:     util.NewTopic(),
+		workers:   &sync.Map{},
+		log:       log.New("worker", "verifier"),
 	}
 }
 
@@ -52,7 +52,7 @@ func NewVerifier(cfg *config.Verifier, db *database.Database, signer *ethutil.Si
 func (w *Verifier) Start(ctx context.Context) {
 	w.log.Info(
 		"Worker started",
-		"signer", w.signer.Signer,
+		"signer", w.signerCtx.Signer,
 		"interval", w.cfg.Interval,
 		"state-collect-limit", w.cfg.StateCollectLimit,
 		"concurrency", w.cfg.Concurrency,
@@ -92,11 +92,11 @@ func (w *Verifier) Start(ctx context.Context) {
 
 						if worker, ok := data.(verifyWorker); ok {
 							worker.work(&verifyWorkerContext{
-								cfg:    w.cfg,
-								db:     w.db,
-								signer: w.signer,
-								topic:  w.topic,
-								log:    w.log.New(),
+								cfg:       w.cfg,
+								db:        w.db,
+								signerCtx: w.signerCtx,
+								topic:     w.topic,
+								log:       w.log.New(),
 							}, ctx)
 						}
 					}
@@ -110,8 +110,8 @@ func (w *Verifier) Start(ctx context.Context) {
 	}
 }
 
-func (w *Verifier) Signer() *ethutil.SignerContext {
-	return w.signer
+func (w *Verifier) SignerContext() *ethutil.SignerContext {
+	return w.signerCtx
 }
 
 func (w *Verifier) AddWorker(worker verifyWorker) {

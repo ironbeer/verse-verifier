@@ -11,6 +11,7 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/oasysgames/oasys-optimism-verifier/contract/scc"
 	"github.com/oasysgames/oasys-optimism-verifier/database"
 	"github.com/oasysgames/oasys-optimism-verifier/ethutil"
 	"github.com/oasysgames/oasys-optimism-verifier/util"
@@ -18,8 +19,8 @@ import (
 
 var (
 	// See: https://github.com/oasysgames/oasys-optimism/blob/134491cc2cd9ec588bbaad7697beaf74deddece7/packages/contracts/contracts/libraries/utils/Lib_MerkleTree.sol#L29-L46
-	merkleDefaultBytes [][32]byte
-	merkleDefaultHexs  = []string{
+	merkleDefaults    []common.Hash
+	merkleDefaultHexs = []string{
 		"0x290decd9548b62a8d60345a988386fc84ba6bc95484008f6362f93160ef3e563",
 		"0x633dc4d7da7256660a892f8f1604a44b5432649cc8ec5cb3ced4c4e6ac94dd1d",
 		"0x890740a8eb06ce9be422cb8da5cdafc2b58c0a5e24036c578de2a433c828ff7d",
@@ -39,27 +40,23 @@ var (
 	}
 )
 
-type sccInterface interface {
-	NextIndex(*bind.CallOpts) (*big.Int, error)
-}
-
 func init() {
-	merkleDefaultBytes = make([][32]byte, len(merkleDefaultHexs))
+	merkleDefaults = make([]common.Hash, len(merkleDefaultHexs))
 	for i, hex := range merkleDefaultHexs {
-		merkleDefaultBytes[i] = util.BytesToBytes32(common.FromHex(hex))
+		merkleDefaults[i] = common.HexToHash(hex)
 	}
 }
 
 type sccVerifyWorker struct {
 	l2Client ethutil.ReadOnlyClient
 	sccAddr  common.Address
-	scc      sccInterface
+	scc      *scc.Scc
 }
 
 func NewSccVerifyWorker(
 	l2Client ethutil.ReadOnlyClient,
 	sccAddr common.Address,
-	scc sccInterface,
+	scc *scc.Scc,
 ) verifyWorker {
 	return &sccVerifyWorker{
 		l2Client: l2Client,
@@ -98,7 +95,7 @@ func (w *sccVerifyWorker) work(wc *verifyWorkerContext, ctx context.Context) {
 
 	for i := nextIndex.Uint64(); ; i++ {
 		states, err := wc.db.Optimism.FindVerificationWaitingStates(
-			wc.signer.Signer, w.sccAddr, i, 1)
+			wc.signerCtx.Signer, w.sccAddr, i, 1)
 		if err != nil {
 			wc.log.Error("Failed to find states", "err", err)
 			return
@@ -118,7 +115,7 @@ func (w *sccVerifyWorker) work(wc *verifyWorkerContext, ctx context.Context) {
 
 		row, err := wc.db.Optimism.SaveSignature(
 			nil, nil,
-			wc.signer.Signer, state.OptimismScc.Address,
+			wc.signerCtx.Signer, state.OptimismScc.Address,
 			state.BatchIndex, state.BatchRoot, state.BatchSize,
 			state.PrevTotalElements, state.ExtraData,
 			approved, sig)
@@ -189,13 +186,13 @@ func (w *sccVerifyWorker) verifyState(
 
 	// calc and save signature
 	msg := NewSccMessage(
-		wc.signer.ChainID,
+		wc.signerCtx.ChainID,
 		state.OptimismScc.Address,
 		new(big.Int).SetUint64(state.BatchIndex),
 		state.BatchRoot,
 		approved,
 	)
-	if sig, err := msg.Signature(wc.signer.SignData); err == nil {
+	if sig, err := msg.Signature(wc.signerCtx.SignData); err == nil {
 		return approved, sig, nil
 	} else {
 		wc.log.Error("Failed to calculate signature", append(logCtx, "err", err)...)
@@ -206,8 +203,7 @@ func (w *sccVerifyWorker) verifyState(
 func (w *sccVerifyWorker) deleteInvalidSignature(wc *verifyWorkerContext, nextIndex uint64) {
 	logCtx := []interface{}{"next-index", nextIndex}
 
-	signer := wc.signer.Signer
-	sigs, err := wc.db.Optimism.FindSignatures(nil, &signer, &w.sccAddr, &nextIndex, 1, 0)
+	sigs, err := wc.db.Optimism.FindSignatures(nil, &wc.signerCtx.Signer, &w.sccAddr, &nextIndex, 1, 0)
 	if err != nil {
 		wc.log.Error("Unable to find signatures", append(logCtx, "err", err)...)
 		return
@@ -217,12 +213,12 @@ func (w *sccVerifyWorker) deleteInvalidSignature(wc *verifyWorkerContext, nextIn
 	}
 
 	msg := NewSccMessage(
-		wc.signer.ChainID,
+		wc.signerCtx.ChainID,
 		sigs[0].OptimismScc.Address,
 		new(big.Int).SetUint64(sigs[0].BatchIndex),
 		sigs[0].BatchRoot,
 		sigs[0].Approved)
-	if match, err := msg.VerifySigner(sigs[0].Signature[:], signer); err == nil && match {
+	if match, err := msg.VerifySigner(sigs[0].Signature[:], wc.signerCtx.Signer); err == nil && match {
 		wc.log.Debug("No invalid signature", logCtx...)
 		return
 	} else if err != nil {
@@ -231,7 +227,7 @@ func (w *sccVerifyWorker) deleteInvalidSignature(wc *verifyWorkerContext, nextIn
 
 	wc.log.Warn("Found invalid signature", append(logCtx, "signature", sigs[0].Signature.Hex())...)
 
-	if rows, err := wc.db.Optimism.DeleteSignatures(signer, w.sccAddr, nextIndex); err != nil {
+	if rows, err := wc.db.Optimism.DeleteSignatures(wc.signerCtx.Signer, w.sccAddr, nextIndex); err != nil {
 		wc.log.Error("Unable to delete signatures", append(logCtx, "err", err)...)
 	} else {
 		wc.log.Warn("Deleted invalid signature", append(logCtx, "delete-rows", rows)...)
@@ -265,7 +261,7 @@ func calcMerkleRoot(elements [][32]byte) ([32]byte, error) {
 
 		if rowSizeIsOdd {
 			leftSibling := elements[rowSize-1][:]
-			rightSibling := merkleDefaultBytes[depth][:]
+			rightSibling := merkleDefaults[depth][:]
 			elements[halfRowSize] = util.BytesToBytes32(
 				crypto.Keccak256(bytes.Join([][]byte{leftSibling, rightSibling}, []byte(""))),
 			)

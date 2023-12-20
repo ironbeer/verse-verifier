@@ -14,42 +14,29 @@ import (
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/oasysgames/oasys-optimism-verifier/config"
+	"github.com/oasysgames/oasys-optimism-verifier/contract/l2oo"
 	"github.com/oasysgames/oasys-optimism-verifier/contract/scc"
 	"github.com/oasysgames/oasys-optimism-verifier/database"
-	"github.com/oasysgames/oasys-optimism-verifier/testhelper"
+	"github.com/oasysgames/oasys-optimism-verifier/ethutil"
 	"github.com/oasysgames/oasys-optimism-verifier/util"
 	"github.com/stretchr/testify/suite"
 
 	"github.com/oasysgames/oasys-optimism-verifier/testhelper/backend"
-	tscc "github.com/oasysgames/oasys-optimism-verifier/testhelper/contracts/scc"
 )
 
 type VerifierTestSuite struct {
-	testhelper.Suite
+	backend.BackendSuite
 
-	db    *database.Database
-	hub   *backend.TestBackend
-	verse *backend.TestBackend
-
-	scc     *tscc.Scc
-	sccAddr common.Address
-
-	verifier *Verifier
+	verifier            *Verifier
+	l2ToL1MessagePasser common.Address
 }
 
-func TestVerifier(t *testing.T) {
+func TestSccVerifier(t *testing.T) {
 	suite.Run(t, new(VerifierTestSuite))
 }
 
 func (s *VerifierTestSuite) SetupTest() {
-	// setup test env
-	s.db, _ = database.NewDatabase(&config.Database{Path: ":memory:"})
-	s.hub = backend.NewTestBackend()
-	s.verse = backend.NewTestBackend()
-
-	// deploy `StateCommitmentChain` contract
-	s.sccAddr, _, s.scc, _ = tscc.DeployScc(s.hub.TransactOpts(context.Background()), s.hub)
-	s.hub.Mining()
+	s.BackendSuite.SetupTest()
 
 	// setup verifier
 	s.verifier = NewVerifier(&config.Verifier{
@@ -57,55 +44,94 @@ func (s *VerifierTestSuite) SetupTest() {
 		Concurrency:         10,
 		StateCollectLimit:   2,
 		StateCollectTimeout: time.Second,
-	}, s.db, s.hub.SignerContext())
-	s.verifier.AddWorker(NewSccVerifyWorker(s.verse, s.sccAddr, s.scc))
+	}, s.DB, s.Hub.SignerContext())
+
+	s.verifier.AddWorker(NewSccVerifyWorker(s.Verse, s.SCCAddr, s.SCC))
+	s.verifier.AddWorker(NewL2OOVerifyWorker(s.Verse, s.L2OOAddr, s.L2OO))
+
+	s.l2ToL1MessagePasser = common.HexToAddress("0x4200000000000000000000000000000000000016")
 }
 
-func (s *VerifierTestSuite) TestVerify() {
-	cases := []struct {
-		batchRoot     string
-		wantSignature string
+func (s *VerifierTestSuite) TestVerifySCC() {
+	type case_ struct {
+		batchRoot     common.Hash
 		wantApproved  bool
-	}{
-		{
-			"0xa32f22db573ecdc5eafbb5d1cc99b51ebc603f26bb0becac52e46157eddbe005",
-			"0x02141577e2d1ff2230c728436a61f2050a6cd7fb91c10c646b115447e6052e5355599c3f9225553c9bc06c5cfa4a0cbf1cd50f072e354a0a1d3549567f7e05591c",
-			true,
-		},
-		{
-			"0x3b6af01f7666ff6990d8ccaa995f6efdae442ad24b5a354a70029ed8a2713357",
-			"0x7636fc9abc773fbebf17e87c3445f5a66a243a32595cf1f50d732e3db3e20d32082df7f820130eb14fe553a7223972ba3b68dfd4123bda67b28939fe51b3be181c",
-			false,
-		},
+		wantSignature database.Signature
+	}
+	cases := []*case_{
+		{wantApproved: true},
+		{wantApproved: false},
 	}
 
 	batchSize := 10
 
 	// send transactions to verse-layer
-	s.sendTransaction(10 * len(cases))
+	for i, tt := range cases {
+		stateRoots := make([][32]byte, batchSize)
+		for j, h := range s.sendVerseTX(s.RandAddress(), batchSize) {
+			if tt.wantApproved {
+				stateRoots[j] = h.Root
+			} else {
+				stateRoots[j] = s.RandHash()
+			}
+		}
+
+		batchRoot, err := calcMerkleRoot(stateRoots)
+		s.Nil(err)
+
+		wantSignature, err := NewSccMessage(
+			s.Hub.ChainID(),
+			s.SCCAddr,
+			big.NewInt(int64(i)),
+			batchRoot,
+			tt.wantApproved).Signature(s.Hub.SignData)
+		s.Nil(err)
+
+		tt.batchRoot = batchRoot
+		tt.wantSignature = wantSignature
+	}
 
 	// emit and collect `StateBatchAppended` events
 	for i, tt := range cases {
-		s.db.Optimism.SaveState(&scc.SccStateBatchAppended{
-			Raw:               types.Log{Address: s.sccAddr},
+		_, err := s.DB.Optimism.SaveState(&scc.SccStateBatchAppended{
+			Raw:               types.Log{Address: s.SCCAddr},
 			BatchIndex:        big.NewInt(int64(i)),
-			BatchRoot:         util.BytesToBytes32(common.FromHex(tt.batchRoot)),
+			BatchRoot:         tt.batchRoot,
 			BatchSize:         big.NewInt(int64(batchSize)),
 			PrevTotalElements: big.NewInt(int64(batchSize * i)),
 			ExtraData:         []byte(fmt.Sprintf("test-%d", batchSize))})
+		s.Nil(err)
 	}
 
 	// subscribe new signature
-	subscribes := s.startAndWait(s.verifier, len(cases))
+	published, _ := startAndWait(s.verifier, len(cases))
 
 	// assert
 	for i, tt := range cases {
-		index := uint64(i)
-		got0, _ := s.db.Optimism.FindSignatures(nil, nil, nil, &index, 1, 0)
-		got1 := subscribes[i]
+		ui64 := uint64(i)
 
-		s.Equal(tt.batchRoot, got0[0].BatchRoot.Hex())
-		s.Equal(tt.batchRoot, got1.BatchRoot.Hex())
+		got0, err := s.DB.Optimism.FindSignatures(nil, nil, nil, &ui64, 1, 0)
+		got1 := published[i]
+		s.Nil(err)
+
+		s.IsType("string", got0[0].ID)
+		s.IsType("string", got0[0].PreviousID)
+		s.IsType("string", got1.ID)
+		s.IsType("string", got1.PreviousID)
+		s.Greater(got0[0].ID, got0[0].PreviousID)
+		s.Greater(got1.ID, got1.PreviousID)
+
+		s.Equal(s.Hub.Signer(), got0[0].Signer.Address)
+		s.Equal(s.Hub.Signer(), got1.Signer.Address)
+
+		s.Equal(s.SCCAddr, got0[0].OptimismScc.Address)
+		s.Equal(s.SCCAddr, got1.OptimismScc.Address)
+
+		s.Equal(ui64, got0[0].BatchIndex)
+		s.Equal(ui64, got1.BatchIndex)
+
+		s.Equal(tt.batchRoot[:], got0[0].BatchRoot[:])
+		s.Equal(tt.batchRoot[:], got1.BatchRoot[:])
 
 		s.Equal(uint64(batchSize), got0[0].BatchSize)
 		s.Equal(uint64(batchSize), got1.BatchSize)
@@ -119,12 +145,117 @@ func (s *VerifierTestSuite) TestVerify() {
 		s.Equal(tt.wantApproved, got0[0].Approved)
 		s.Equal(tt.wantApproved, got1.Approved)
 
-		s.Equal(tt.wantSignature, got0[0].Signature.Hex())
-		s.Equal(tt.wantSignature, got1.Signature.Hex())
+		s.Equal(tt.wantSignature[:], got0[0].Signature[:])
+		s.Equal(tt.wantSignature[:], got1.Signature[:])
 	}
 }
 
-func (s *VerifierTestSuite) TestDeleteInvalidSignature() {
+func (s *VerifierTestSuite) TestVerifyL2OO() {
+	type case_ struct {
+		outputRoot    [32]byte
+		wantApproved  bool
+		wantSignature database.Signature
+	}
+	cases := []*case_{
+		{wantApproved: true},
+		{wantApproved: false},
+	}
+
+	l1Timestamp := time.Now().Unix()
+	l2Block, err := s.Verse.BlockNumber(context.Background())
+	s.Nil(err)
+
+	// send transactions to verse-layer
+	for i, tt := range cases {
+		head := s.sendVerseTX(s.l2ToL1MessagePasser, 1)[0]
+
+		proof, err := s.Verse.GetProof(
+			context.Background(), s.l2ToL1MessagePasser, []string{}, head.Number)
+		s.Nil(err)
+
+		var outputRoot [32]byte
+		if tt.wantApproved {
+			outputV0 := &ethutil.OpstackOutputV0{
+				StateRoot:                head.Root,
+				MessagePasserStorageRoot: proof.StorageHash,
+				BlockHash:                head.Hash(),
+			}
+			outputRoot = outputV0.OutputRoot()
+		} else {
+			outputRoot = s.RandHash()
+		}
+
+		wantSignature, err := NewL2ooMessage(
+			s.Hub.ChainID(),
+			s.L2OOAddr,
+			big.NewInt(int64(i)),
+			outputRoot,
+			big.NewInt(l1Timestamp+int64(i)),
+			big.NewInt(int64(l2Block)+int64(i)+1),
+			tt.wantApproved).Signature(s.Hub.SignData)
+		s.Nil(err)
+
+		tt.outputRoot = outputRoot
+		tt.wantSignature = wantSignature
+	}
+
+	// emit and collect `OutputProposed` events
+	for i, tt := range cases {
+		_, err := s.DB.OPStack.SaveProposal(&l2oo.OasysL2OutputOracleOutputProposed{
+			Raw:           types.Log{Address: s.L2OOAddr},
+			OutputRoot:    tt.outputRoot,
+			L2OutputIndex: big.NewInt(int64(i)),
+			L2BlockNumber: big.NewInt(int64(l2Block) + int64(i) + 1),
+			L1Timestamp:   big.NewInt(l1Timestamp + int64(i)),
+		})
+		s.Nil(err)
+	}
+
+	// subscribe new signature
+	_, published := startAndWait(s.verifier, len(cases))
+
+	// assert
+	for i, tt := range cases {
+		ui64 := uint64(i)
+
+		got0, err := s.DB.OPStack.FindSignatures(nil, nil, nil, &ui64, 1, 0)
+		got1 := published[i]
+		s.Nil(err)
+
+		s.IsType("string", got0[0].ID)
+		s.IsType("string", got0[0].PreviousID)
+		s.IsType("string", got1.ID)
+		s.IsType("string", got1.PreviousID)
+		s.Greater(got0[0].ID, got0[0].PreviousID)
+		s.Greater(got1.ID, got1.PreviousID)
+
+		s.Equal(s.Hub.Signer(), got0[0].Signer.Address)
+		s.Equal(s.Hub.Signer(), got1.Signer.Address)
+
+		s.Equal(s.L2OOAddr, got0[0].OpstackL2OutputOracle.Address)
+		s.Equal(s.L2OOAddr, got1.OpstackL2OutputOracle.Address)
+
+		s.Equal(ui64, got0[0].L2OutputIndex)
+		s.Equal(ui64, got1.L2OutputIndex)
+
+		s.Equal(tt.outputRoot[:], got0[0].OutputRoot[:])
+		s.Equal(tt.outputRoot[:], got1.OutputRoot[:])
+
+		s.Equal(l2Block+ui64+1, got0[0].L2BlockNumber)
+		s.Equal(l2Block+ui64+1, got1.L2BlockNumber)
+
+		s.Equal(uint64(l1Timestamp)+ui64, got0[0].L1Timestamp)
+		s.Equal(uint64(l1Timestamp)+ui64, got1.L1Timestamp)
+
+		s.Equal(tt.wantApproved, got0[0].Approved)
+		s.Equal(tt.wantApproved, got1.Approved)
+
+		s.Equal(tt.wantSignature[:], got0[0].Signature[:])
+		s.Equal(tt.wantSignature[:], got1.Signature[:])
+	}
+}
+
+func (s *VerifierTestSuite) TestDeleteInvalidSCCSignature() {
 	batches := s.Range(0, 10)
 	batchSize := 5
 	invalidBatch := 6
@@ -133,7 +264,7 @@ func (s *VerifierTestSuite) TestDeleteInvalidSignature() {
 	merkleRoots := make([][32]byte, len(batches))
 	for batchIdx := range batches {
 		elements := make([][32]byte, batchSize)
-		for i, header := range s.sendTransaction(batchSize) {
+		for i, header := range s.sendVerseTX(s.RandAddress(), batchSize) {
 			elements[i] = header.Root
 		}
 		if merkleRoot, err := calcMerkleRoot(elements); s.NoError(err) {
@@ -144,8 +275,8 @@ func (s *VerifierTestSuite) TestDeleteInvalidSignature() {
 	createds := make([]*database.OptimismSignature, len(batches))
 	for batchIdx, merkleRoot := range merkleRoots {
 		// save verify waiting state
-		s.db.Optimism.SaveState(&scc.SccStateBatchAppended{
-			Raw:               types.Log{Address: s.sccAddr},
+		s.DB.Optimism.SaveState(&scc.SccStateBatchAppended{
+			Raw:               types.Log{Address: s.SCCAddr},
 			BatchIndex:        big.NewInt(int64(batchIdx)),
 			BatchRoot:         merkleRoot,
 			BatchSize:         big.NewInt(int64(batchSize)),
@@ -153,27 +284,28 @@ func (s *VerifierTestSuite) TestDeleteInvalidSignature() {
 			ExtraData:         []byte(fmt.Sprintf("test-%d", batchIdx))})
 
 		// run verification
-		sigs := s.startAndWait(s.verifier, 1)
-		s.Len(sigs, 1)
-		s.Equal(merkleRoot[:], sigs[0].BatchRoot[:])
-		createds[batchIdx] = sigs[0]
+		published, _ := startAndWait(s.verifier, 1)
+		s.Len(published, 1)
+		s.Equal(merkleRoot[:], published[0].BatchRoot[:])
+		createds[batchIdx] = published[0]
 	}
 
 	// increment `nextIndex`
 	for batchIdx := range s.Range(0, invalidBatch) {
-		s.scc.EmitStateBatchVerified(
-			s.hub.TransactOpts(context.Background()),
+		s.TSCC.EmitStateBatchVerified(
+			s.Hub.TransactOpts(context.Background()),
 			big.NewInt(int64(batchIdx)),
 			merkleRoots[batchIdx],
 		)
-		s.hub.Commit()
+		s.Hub.Commit()
 	}
 
 	// run `deleteInvalidSignature`, but nothing happens
-	s.Len(s.startAndWait(s.verifier, 1), 0)
+	published, _ := startAndWait(s.verifier, 1)
+	s.Len(published, 0)
 
-	signer := s.hub.Signer()
-	gots, _ := s.db.Optimism.FindSignatures(nil, &signer, &s.sccAddr, nil, 100, 0)
+	signer := s.Hub.Signer()
+	gots, _ := s.DB.Optimism.FindSignatures(nil, &signer, &s.SCCAddr, nil, 100, 0)
 	s.Equal(len(batches), len(gots))
 
 	for batchIdx := range batches {
@@ -183,7 +315,7 @@ func (s *VerifierTestSuite) TestDeleteInvalidSignature() {
 	}
 
 	// update to invalid signature
-	s.db.Optimism.SaveSignature(
+	s.DB.Optimism.SaveSignature(
 		&createds[invalidBatch].ID,
 		&createds[invalidBatch].PreviousID,
 		createds[invalidBatch].Signer.Address,
@@ -197,12 +329,10 @@ func (s *VerifierTestSuite) TestDeleteInvalidSignature() {
 		database.RandSignature())
 
 	// run `deleteInvalidSignature`
-	s.Len(
-		s.startAndWait(s.verifier, len(batches)-invalidBatch),
-		len(batches)-invalidBatch,
-	)
+	published, _ = startAndWait(s.verifier, len(batches)-invalidBatch)
+	s.Len(published, len(batches)-invalidBatch)
 
-	gots, _ = s.db.Optimism.FindSignatures(nil, &signer, &s.sccAddr, nil, 100, 0)
+	gots, _ = s.DB.Optimism.FindSignatures(nil, &signer, &s.SCCAddr, nil, 100, 0)
 	s.Equal(len(batches), len(gots))
 
 	for batchIdx := range batches {
@@ -213,6 +343,99 @@ func (s *VerifierTestSuite) TestDeleteInvalidSignature() {
 			s.NotEqual(createds[batchIdx].ID, gots[batchIdx].ID)
 		}
 		s.Equal(createds[batchIdx].Signature, gots[batchIdx].Signature)
+	}
+}
+
+func (s *VerifierTestSuite) TestDeleteInvalidL2OOSignature() {
+	invalidOutputIdx := 6
+
+	l2Block, err := s.Verse.BlockNumber(context.Background())
+	s.Nil(err)
+
+	// send transactions to verse-layer
+	outputRoots := make([][32]byte, 10)
+	for i := range outputRoots {
+		head := s.sendVerseTX(s.l2ToL1MessagePasser, 1)[0]
+
+		proof, err := s.Verse.GetProof(
+			context.Background(), s.l2ToL1MessagePasser, []string{}, head.Number)
+		s.Nil(err)
+
+		outputV0 := &ethutil.OpstackOutputV0{
+			StateRoot:                head.Root,
+			MessagePasserStorageRoot: proof.StorageHash,
+			BlockHash:                head.Hash(),
+		}
+		outputRoots[i] = outputV0.OutputRoot()
+	}
+
+	createds := make([]*database.OpstackSignature, len(outputRoots))
+	for outputIdx, outputRoot := range outputRoots {
+		// save verify waiting proposal
+		s.DB.OPStack.SaveProposal(&l2oo.OasysL2OutputOracleOutputProposed{
+			Raw:           types.Log{Address: s.L2OOAddr},
+			OutputRoot:    outputRoot,
+			L2OutputIndex: big.NewInt(int64(outputIdx)),
+			L2BlockNumber: big.NewInt(int64(l2Block) + int64(outputIdx) + 1),
+			L1Timestamp:   big.NewInt(time.Now().Unix()),
+		})
+
+		// run verification
+		_, published := startAndWait(s.verifier, 1)
+		s.Len(published, 1)
+		s.Equal(outputRoot[:], published[0].OutputRoot[:])
+		createds[outputIdx] = published[0]
+	}
+
+	// increments `nextVerifyIndex`
+	_, err = s.TL2OO.SetNextVerifyIndex(
+		s.Hub.TransactOpts(context.Background()), big.NewInt(int64(invalidOutputIdx)))
+	s.Nil(err)
+	s.Hub.Commit()
+
+	// run `deleteInvalidSignature`, but nothing happens
+	_, published := startAndWait(s.verifier, 1)
+	s.Len(published, 0)
+
+	gots, _ := s.DB.OPStack.FindSignatures(
+		nil, &s.verifier.signerCtx.Signer, &s.L2OOAddr, nil, 100, 0)
+	s.Equal(len(outputRoots), len(gots))
+
+	for outputIdx := range outputRoots {
+		// should not be re-created
+		s.Equal(createds[outputIdx].ID, gots[outputIdx].ID)
+		s.Equal(createds[outputIdx].Signature, gots[outputIdx].Signature)
+	}
+
+	// update to invalid signature
+	_, err = s.DB.OPStack.SaveSignature(
+		&createds[invalidOutputIdx].ID,
+		&createds[invalidOutputIdx].PreviousID,
+		createds[invalidOutputIdx].Signer.Address,
+		createds[invalidOutputIdx].OpstackL2OutputOracle.Address,
+		createds[invalidOutputIdx].L2OutputIndex,
+		createds[invalidOutputIdx].OutputRoot,
+		createds[invalidOutputIdx].L2BlockNumber,
+		createds[invalidOutputIdx].L1Timestamp,
+		createds[invalidOutputIdx].Approved,
+		database.RandSignature())
+	s.Nil(err)
+
+	// run `deleteInvalidSignature`
+	_, published = startAndWait(s.verifier, len(outputRoots)-invalidOutputIdx)
+	s.Len(published, len(outputRoots)-invalidOutputIdx)
+
+	gots, _ = s.DB.OPStack.FindSignatures(nil, &s.verifier.signerCtx.Signer, &s.L2OOAddr, nil, 100, 0)
+	s.Equal(len(outputRoots), len(gots))
+
+	for outputIdx := range outputRoots {
+		if outputIdx < invalidOutputIdx {
+			s.Equal(createds[outputIdx].ID, gots[outputIdx].ID)
+		} else {
+			// should be re-created
+			s.NotEqual(createds[outputIdx].ID, gots[outputIdx].ID)
+		}
+		s.Equal(createds[outputIdx].Signature, gots[outputIdx].Signature)
 	}
 }
 
@@ -297,18 +520,14 @@ func (s *VerifierTestSuite) TestCalcMerkleRoot() {
 	}
 }
 
-func (s *VerifierTestSuite) sendTransaction(count int) (headers []*types.Header) {
+func (s *VerifierTestSuite) sendVerseTX(to common.Address, count int) (headers []*types.Header) {
 	for i := 0; i < count; i++ {
-		signedTx, _ := s.hub.SignTx(types.NewTransaction(
-			uint64(i),
-			common.HexToAddress("0x09ad74977844F513E61AdE2B50b0C06268A4f6d7"),
-			common.Big0,
-			uint64(21_000),
-			big.NewInt(875_000_000),
-			nil))
+		signedTx, err := s.Verse.SignTx(types.NewTransaction(
+			uint64(i), to, common.Big1, uint64(21_000), big.NewInt(875_000_000), nil))
+		s.Nil(err)
 
-		s.verse.SendTransaction(context.Background(), signedTx)
-		if h, err := s.verse.HeaderByHash(context.Background(), s.verse.Commit()); s.NoError(err) {
+		s.Verse.SendTransaction(context.Background(), signedTx)
+		if h, err := s.Verse.HeaderByHash(context.Background(), s.Verse.Commit()); s.NoError(err) {
 			headers = append(headers, h)
 		}
 	}
@@ -332,32 +551,35 @@ func (s *VerifierTestSuite) fillDefaultHashes(elements [][32]byte) [][32]byte {
 	return filled
 }
 
-func (s *VerifierTestSuite) startAndWait(
+func startAndWait(
 	verifier *Verifier,
 	count int,
-) []*database.OptimismSignature {
-	ctx, candel := context.WithTimeout(context.Background(), time.Second/2)
-	defer candel()
+) (sccs []*database.OptimismSignature, l2oos []*database.OpstackSignature) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second/2)
+	defer cancel()
 
 	sub := verifier.SubscribeNewSignature(ctx)
 	defer sub.Cancel()
 
-	published := []*database.OptimismSignature{}
 	go func() {
-		defer candel()
+		defer cancel()
 
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case sig := <-sub.Next():
-				if t, ok := sig.(*database.OptimismSignature); !ok {
+				switch t := sig.(type) {
+				case *database.OptimismSignature:
+					sccs = append(sccs, t)
+				case *database.OpstackSignature:
+					l2oos = append(l2oos, t)
+				default:
 					panic(fmt.Errorf("Unknown signature: %v", sig))
-				} else {
-					published = append(published, t)
-					if len(published) == count {
-						return
-					}
+				}
+
+				if len(sccs)+len(l2oos) == count {
+					return
 				}
 			}
 		}
@@ -367,5 +589,5 @@ func (s *VerifierTestSuite) startAndWait(
 	go verifier.Start(ctx)
 	<-ctx.Done()
 
-	return published
+	return sccs, l2oos
 }

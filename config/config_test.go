@@ -157,9 +157,9 @@ func (s *ConfigTestSuite) TestParseConfig() {
 		Confirmations:     4,
 		GasMultiplier:     1.5,
 		BatchSize:         100,
-		MaxGas:            1_000,
 		VerifierAddress:   "0xC79800039e6c4d6C29E10F2aCf2158516Fe686AA",
 		Multicall2Address: "0x74746c14ABD3b4e8B6317e279E8C9e27D9dA56E5",
+		UseMulticall:      true,
 		Targets: []struct {
 			ChainID uint64 "json:\"chain_id\"     mapstructure:\"chain_id\"     validate:\"required\""
 			Wallet  string "json:\"wallet\" validate:\"required\""
@@ -277,9 +277,9 @@ func (s *ConfigTestSuite) TestDefaultValues() {
 	s.Equal(6, got.Submitter.Confirmations)
 	s.Equal(1.1, got.Submitter.GasMultiplier)
 	s.Equal(20, got.Submitter.BatchSize)
-	s.Equal(5_000_000, got.Submitter.MaxGas)
 	s.Equal("0x5200000000000000000000000000000000000014", got.Submitter.VerifierAddress)
 	s.Equal("0x5200000000000000000000000000000000000022", got.Submitter.Multicall2Address)
+	s.Equal(true, got.Submitter.UseMulticall)
 
 	s.True(got.Beacon.Enable)
 	s.Equal(

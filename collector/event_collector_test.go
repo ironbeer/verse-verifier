@@ -10,8 +10,8 @@ import (
 	"github.com/oasysgames/oasys-optimism-verifier/config"
 	"github.com/oasysgames/oasys-optimism-verifier/database"
 	"github.com/oasysgames/oasys-optimism-verifier/testhelper/backend"
-	tl2oo "github.com/oasysgames/oasys-optimism-verifier/testhelper/contracts/l2oo"
-	tc "github.com/oasysgames/oasys-optimism-verifier/testhelper/contracts/scc"
+	tl2oo "github.com/oasysgames/oasys-optimism-verifier/testhelper/contract/l2oo"
+	tc "github.com/oasysgames/oasys-optimism-verifier/testhelper/contract/scc"
 	"github.com/stretchr/testify/suite"
 )
 
@@ -38,7 +38,7 @@ func (s *EventCollectorTestSuite) TestHandleStateBatchAppendedEvent() {
 	// emit `StateBatchAppended` events
 	var emits []*tc.SccStateBatchAppended
 	for i := range s.Range(0, 10) {
-		emits = append(emits, s.EmitStateBatchAppendedEvent(i))
+		emits = append(emits, s.EmitStateBatchAppended(i))
 	}
 
 	// collect `StateBatchAppended` events
@@ -62,7 +62,7 @@ func (s *EventCollectorTestSuite) TestHandleStateBatchDeletedEvent() {
 	// emit `StateBatchAppended` events
 	var emits []*tc.SccStateBatchAppended
 	for i := range s.Range(0, 10) {
-		emits = append(emits, s.EmitStateBatchAppendedEvent(i))
+		emits = append(emits, s.EmitStateBatchAppended(i))
 	}
 
 	// collect `StateBatchAppended` events
@@ -237,7 +237,7 @@ func (s *EventCollectorTestSuite) TestNoHandleOtherEvent() {
 
 	// emit `StateBatchAppended` and `Other` events
 	for i := range s.Range(0, 10) {
-		s.EmitStateBatchAppendedEvent(i)
+		s.EmitStateBatchAppended(i)
 		s.TSCC.EmitOtherEvent(s.Hub.TransactOpts(ctx), big.NewInt(11))
 		s.Mining()
 	}
@@ -262,7 +262,7 @@ func (s *EventCollectorTestSuite) TestHandleSCCReorganization() {
 	// emit `StateBatchAppended` events
 	var emits []*tc.SccStateBatchAppended
 	for i := range s.Range(0, 10) {
-		emits = append(emits, s.EmitStateBatchAppendedEvent(i))
+		emits = append(emits, s.EmitStateBatchAppended(i))
 	}
 
 	// collect `StateBatchAppended` events
@@ -287,7 +287,7 @@ func (s *EventCollectorTestSuite) TestHandleSCCReorganization() {
 	}
 
 	// simulate chain reorganization
-	s.EmitStateBatchAppendedEvent(4)
+	s.EmitStateBatchAppended(4)
 	s.collector.work(ctx)
 
 	// assert

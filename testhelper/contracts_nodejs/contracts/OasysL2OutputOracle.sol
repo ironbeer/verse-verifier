@@ -18,6 +18,10 @@ contract OasysL2OutputOracle {
 
     uint256 public nextVerifyIndex;
 
+    function setNextVerifyIndex(uint256 val) external {
+        nextVerifyIndex = val;
+    }
+
     function emitOutputProposed(
         bytes32 outputRoot,
         uint256 l2OutputIndex,
@@ -43,9 +47,5 @@ contract OasysL2OutputOracle {
         require(l2OutputIndex >= nextVerifyIndex, "L2OutputOracle: Invalid L2 output index");
 
         emit OutputFailed(l2OutputIndex, outputRoot, l2BlockNumber);
-    }
-
-    function setNextVerifyIndex(uint256 val) external {
-        nextVerifyIndex = val;
     }
 }

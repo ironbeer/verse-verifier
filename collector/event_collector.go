@@ -325,7 +325,9 @@ func handleOutputProposedEvent(w *EventCollector, tx *database.Database, event i
 		logCtx      = []interface{}{
 			"block", e.Raw.BlockNumber,
 			"l2oo", address.Hex(),
-			"index", outputIndex,
+			"l2-output-index", outputIndex,
+			"l2-block", e.L2BlockNumber.Uint64(),
+			"l1-timestamp", e.L1Timestamp.Uint64(),
 		}
 	)
 	w.log.Info("New L2OO.OutputProposed event", logCtx...)

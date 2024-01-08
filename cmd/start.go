@@ -23,7 +23,9 @@ import (
 	"github.com/oasysgames/oasys-optimism-verifier/collector"
 	"github.com/oasysgames/oasys-optimism-verifier/config"
 	"github.com/oasysgames/oasys-optimism-verifier/contract/l2oo"
+	"github.com/oasysgames/oasys-optimism-verifier/contract/multicall2"
 	"github.com/oasysgames/oasys-optimism-verifier/contract/scc"
+	"github.com/oasysgames/oasys-optimism-verifier/contract/sccverifier"
 	"github.com/oasysgames/oasys-optimism-verifier/contract/stakemanager"
 	"github.com/oasysgames/oasys-optimism-verifier/database"
 	"github.com/oasysgames/oasys-optimism-verifier/ethutil"
@@ -482,15 +484,44 @@ func startVerseDiscovery(
 								account,
 							)
 							if err != nil {
-								log.Error("Failed to create hub-layer client", "err", err)
+								log.Error("Failed to construct hub-layer client", "err", err)
 								return true
 							}
 
+							verifier, err := sccverifier.NewOasysRollupVerifier(
+								common.HexToAddress(c.Submitter.VerifierAddress), l1Client)
+							if err != nil {
+								log.Error("Failed to construct OasysRollupVerifier contract", "err", err)
+								return true
+							}
+
+							var multicall *multicall2.Multicall2
+							if c.Submitter.UseMulticall {
+								multicall, err = multicall2.NewMulticall2(
+									common.HexToAddress(c.Submitter.Multicall2Address), l1Client)
+								if err != nil {
+									log.Error("Failed to construct OasysRollupVerifier contract", "err", err)
+									return true
+								}
+							}
+
 							if scc_ != nil {
-								submitter.AddTask(submitterpkg.NewSccSubmitTask(l1Client, sccAddr, scc_))
+								task, err := submitterpkg.NewTask(
+									l1Client, sccAddr, scc_, verifier, multicall)
+								if err != nil {
+									log.Error("Failed to add SCC contract submit task", "err", err)
+								} else {
+									submitter.AddTask(t.ChainID, task)
+								}
 							}
 							if l2oo_ != nil {
-								submitter.AddTask(submitterpkg.NewL2OOSubmitTask(l1Client, l2ooAddr, l2oo_))
+								task, err := submitterpkg.NewTask(
+									l1Client, l2ooAddr, l2oo_, verifier, multicall)
+								if err != nil {
+									log.Error("Failed to add L2OO contract submit task", "err", err)
+								} else {
+									submitter.AddTask(t.ChainID, task)
+								}
 							}
 
 							break

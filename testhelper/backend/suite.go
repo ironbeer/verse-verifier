@@ -2,6 +2,7 @@ package backend
 
 import (
 	"context"
+	"fmt"
 	"math/big"
 	"time"
 
@@ -9,13 +10,14 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/oasysgames/oasys-optimism-verifier/config"
 	"github.com/oasysgames/oasys-optimism-verifier/contract/l2oo"
+	"github.com/oasysgames/oasys-optimism-verifier/contract/multicall2"
 	"github.com/oasysgames/oasys-optimism-verifier/contract/scc"
+	"github.com/oasysgames/oasys-optimism-verifier/contract/sccverifier"
 	"github.com/oasysgames/oasys-optimism-verifier/database"
 	"github.com/oasysgames/oasys-optimism-verifier/testhelper"
-	tl2oo "github.com/oasysgames/oasys-optimism-verifier/testhelper/contracts/l2oo"
-	tmcall2 "github.com/oasysgames/oasys-optimism-verifier/testhelper/contracts/multicall2"
-	tscc "github.com/oasysgames/oasys-optimism-verifier/testhelper/contracts/scc"
-	tsccv "github.com/oasysgames/oasys-optimism-verifier/testhelper/contracts/sccverifier"
+	tl2oo "github.com/oasysgames/oasys-optimism-verifier/testhelper/contract/l2oo"
+	tscc "github.com/oasysgames/oasys-optimism-verifier/testhelper/contract/scc"
+	tsccv "github.com/oasysgames/oasys-optimism-verifier/testhelper/contract/sccverifier"
 )
 
 type BackendSuite struct {
@@ -27,7 +29,7 @@ type BackendSuite struct {
 
 	StakeManager *StakeManagerMock
 
-	Mcall2     *tmcall2.Multicall2
+	Mcall2     *multicall2.Multicall2
 	Mcall2Addr common.Address
 
 	SCC     *scc.Scc
@@ -38,7 +40,8 @@ type BackendSuite struct {
 	TL2OO    *tl2oo.L2oo
 	L2OOAddr common.Address
 
-	SCCV     *tsccv.Sccverifier
+	SCCV     *sccverifier.OasysRollupVerifier
+	TSCCV    *tsccv.Sccverifier
 	SCCVAddr common.Address
 }
 
@@ -52,7 +55,7 @@ func (b *BackendSuite) SetupTest() {
 	b.StakeManager = &StakeManagerMock{}
 
 	// deploy `Multicall2` contract
-	b.Mcall2Addr, _, b.Mcall2, _ = tmcall2.DeployMulticall2(b.Hub.TransactOpts(ctx), b.Hub)
+	b.Mcall2Addr, _, b.Mcall2, _ = multicall2.DeployMulticall2(b.Hub.TransactOpts(ctx), b.Hub)
 	b.Hub.Mining()
 
 	// deploy `StateCommitmentChain` contract
@@ -65,8 +68,9 @@ func (b *BackendSuite) SetupTest() {
 	b.L2OO, _ = l2oo.NewOasysL2OutputOracle(b.L2OOAddr, b.Hub)
 	b.Hub.Mining()
 
-	// deploy `OasysStateCommitmentChainVerifier` contract
-	b.SCCVAddr, _, b.SCCV, _ = tsccv.DeploySccverifier(b.Hub.TransactOpts(ctx), b.Hub)
+	// deploy `OasysRollupVerifier` contract
+	b.SCCVAddr, _, b.TSCCV, _ = tsccv.DeploySccverifier(b.Hub.TransactOpts(ctx), b.Hub)
+	b.SCCV, _ = sccverifier.NewOasysRollupVerifier(b.SCCVAddr, b.Hub)
 	b.Hub.Mining()
 }
 
@@ -76,14 +80,14 @@ func (b *BackendSuite) Mining() {
 	b.DB.Block.SaveNewBlock(header.Number.Uint64(), header.Hash())
 }
 
-func (b *BackendSuite) EmitStateBatchAppendedEvent(index int) *tscc.SccStateBatchAppended {
+func (b *BackendSuite) EmitStateBatchAppended(index int) *tscc.SccStateBatchAppended {
 	i64 := int64(index)
 	event := &tscc.SccStateBatchAppended{
 		BatchIndex:        big.NewInt(i64),
 		BatchRoot:         [32]byte(common.BigToHash(big.NewInt(i64))),
 		BatchSize:         big.NewInt(10),
 		PrevTotalElements: big.NewInt(i64 * 10),
-		ExtraData:         []byte("extra data"),
+		ExtraData:         []byte(fmt.Sprintf("ExtraData-%d", index)),
 	}
 	b.TSCC.EmitStateBatchAppended(
 		b.Hub.TransactOpts(context.Background()), event.BatchIndex,
@@ -97,7 +101,7 @@ func (b *BackendSuite) EmitOutputProposed(index int) *tl2oo.L2ooOutputProposed {
 	event := &tl2oo.L2ooOutputProposed{
 		OutputRoot:    b.RandHash(),
 		L2OutputIndex: big.NewInt(int64(index)),
-		L2BlockNumber: big.NewInt(int64(index * 10)),
+		L2BlockNumber: big.NewInt(int64((index + 1) * 10)),
 		L1Timestamp:   big.NewInt(time.Now().Unix()),
 	}
 	_, err := b.TL2OO.EmitOutputProposed(b.Hub.TransactOpts(context.Background()),

@@ -31,9 +31,9 @@ var (
 		"submitter.confirmations":                6,
 		"submitter.gas_multiplier":               1.1,
 		"submitter.batch_size":                   20,
-		"submitter.max_gas":                      5_000_000,
 		"submitter.verifier_address":             "0x5200000000000000000000000000000000000014",
 		"submitter.multicall2_address":           "0x5200000000000000000000000000000000000022",
+		"submitter.use_multicall":                true,
 		"beacon.enable":                          true,
 		"beacon.endpoint":                        "https://script.google.com/macros/s/AKfycbzJpDKyn271jbm5otk_BxGkrS2b1YdMQerVq2-XxLdTOdhUPKCZICqvagvGgByxx_nq0Q/exec",
 		"beacon.interval":                        15 * time.Minute,
@@ -241,14 +241,12 @@ type Submitter struct {
 	// Maximum number of calls for Multicall2.
 	BatchSize int `json:"batch_size" mapstructure:"batch_size"`
 
-	// Maximum gas of calls for Multicall2.
-	MaxGas int `json:"max_gas" mapstructure:"max_gas"`
-
 	// Address of the OasysStateCommitmentChain contract.
 	VerifierAddress string `json:"verifier_address" mapstructure:"verifier_address"`
 
 	// Address of the Multicall2 contract.
 	Multicall2Address string `json:"multicall2_address" mapstructure:"multicall2_address"`
+	UseMulticall      bool   `json:"use_multicall" mapstructure:"use_multicall"`
 
 	Targets []struct {
 		// Chain ID of the Verse-Layer.
@@ -257,6 +255,10 @@ type Submitter struct {
 		// Name of the wallet to send transaction.
 		Wallet string `json:"wallet" validate:"required"`
 	} `json:"targets" validate:"dive"`
+}
+
+func (c *Submitter) MultiplyGas(base uint64) uint64 {
+	return uint64(float64(base) * c.GasMultiplier)
 }
 
 type Beacon struct {

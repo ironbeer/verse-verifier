@@ -66,135 +66,469 @@ func runStartCmd(cmd *cobra.Command, args []string) {
 		syscall.SIGHUP, syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	wg := &sync.WaitGroup{}
+	s := mustNewServer(cmd)
+
+	// start ipc server
+	// Note: must start the IPC server before unlocking the wallet.
+	s.mustStartIPC(ctx)
+
+	// unlock walelts(wait forever)
+	if s.ipc != nil {
+		waitForUnlockWallets(ctx, s.conf, s.ks)
+	}
+
+	// start p2p
+	// Note: must start the P2P before setup beacon worker.
+	s.mustStartP2P(ctx)
+
+	// setup workers
+	s.setupCollector()
+	s.mustSetupVerifier()
+	s.mustSetupSubmitter()
+	s.setupBeacon()
+
+	// start workers
+	s.start(ctx)
+	s.wg.Wait()
+
+	// stopped by signal
+	log.Info("Stopped all workers")
+}
+
+type server struct {
+	wg               sync.WaitGroup
+	conf             *config.Config
+	db               *database.Database
+	ks               *wallet.KeyStore
+	hub              ethutil.ReadOnlyClient
+	ipc              *ipc.IPCServer
+	p2p              *p2p.Node
+	blockCollector   *collector.BlockCollector
+	eventCollector   *collector.EventCollector
+	verifier         *verifierpkg.Verifier
+	submitter        *submitterpkg.Submitter
+	bw               *beacon.BeaconWorker
+	discoveredVerses sync.Map
+	discoveredNotify chan struct{}
+}
+
+func mustNewServer(cmd *cobra.Command) *server {
+	var err error
+
+	s := &server{discoveredNotify: make(chan struct{}, 1)}
 
 	// load configuration file
-	conf, err := loadConfig(cmd)
-	if err != nil {
+	if s.conf, err = loadConfig(cmd); err != nil {
 		log.Crit("Failed to load configuration file", "err", err)
 	}
 
 	// setup database
-	if conf.Database.Path == "" {
-		conf.Database.Path = conf.DatabasePath()
+	if s.conf.Database.Path == "" {
+		s.conf.Database.Path = s.conf.DatabasePath()
 	}
-	db, err := database.NewDatabase(&conf.Database)
-	if err != nil {
+	if s.db, err = database.NewDatabase(&s.conf.Database); err != nil {
 		log.Crit("Failed to open database", "err", err)
 	}
 
 	// open geth keystore
-	ks := wallet.NewKeyStore(conf.KeyStore)
+	s.ks = wallet.NewKeyStore(s.conf.KeyStore)
 
-	// start ipc server
-	// note: start ipc server before unlocking wallet
-	ipc := newIPC(conf, ks)
-	if ipc != nil {
-		wg.Add(1)
+	// construct hub-layer client
+	if s.hub, err = ethutil.NewReadOnlyClient(s.conf.HubLayer.RPC); err != nil {
+		log.Crit("Failed to construct hub-layer client", "err", err)
+	}
+
+	return s
+}
+
+func (s *server) mustStartIPC(ctx context.Context) {
+	if !s.conf.IPC.Enable {
+		return
+	}
+
+	ipc, err := ipc.NewIPCServer(commandName)
+	if err != nil {
+		log.Crit("Failed to start ipc server", "err", err)
+	}
+
+	s.ipc = ipc
+	s.ipc.SetHandler(ipccmd.WalletUnlockCmd.NewHandler(s.ks))
+
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		s.ipc.Start(ctx)
+	}()
+}
+
+func (s *server) mustStartP2P(ctx context.Context) {
+	// get p2p private key
+	p2pKey, err := getOrCreateP2PKey(s.conf.P2PKeyPath())
+	if err != nil {
+		log.Crit("Failed to get(or create) p2p key", "err", err)
+	}
+
+	listen := strings.Split(s.conf.P2P.Listen, ":")
+	host, dht, bwm, err := p2p.NewHost(ctx, listen[0], listen[1], p2pKey)
+	if err != nil {
+		log.Crit("Failed to setup libp2p", "err", err)
+	}
+
+	// etup peer discovery
+	p2p.Bootstrap(ctx, host, dht)
+
+	// connect to bootstrap peers
+	bootnodes := p2p.ConvertPeers(s.conf.P2P.Bootnodes)
+	if len(bootnodes) > 0 {
+		ticker := util.NewTicker(time.Minute, 1)
+		defer ticker.Stop()
+
 		go func() {
-			defer wg.Done()
-			ipc.Start(ctx)
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					p2p.ConnectPeers(ctx, host, bootnodes)
+				}
+			}
 		}()
 	}
 
-	// unlock walelts(wait forever)
-	waitForUnlockWallets(ctx, conf, ks)
-
-	// create hub-layer client
-	hub, err := ethutil.NewReadOnlyClient(conf.HubLayer.RPC)
-	if err != nil {
-		log.Crit("Failed to create hub-layer client", "err", err)
+	// ignore self-signed signatures
+	ignoreSigners := []common.Address{}
+	if s.conf.Verifier.Enable {
+		_, account := findWallet(s.conf, s.ks, s.conf.Verifier.Wallet)
+		ignoreSigners = append(ignoreSigners, account.Address)
 	}
 
+	s.p2p, err = p2p.NewNode(&s.conf.P2P, s.db,
+		host, dht, bwm, s.conf.HubLayer.ChainId, ignoreSigners)
+	if err != nil {
+		log.Crit("Failed to construct p2p node", "err", err)
+	}
+
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		s.p2p.Start(ctx)
+	}()
+}
+
+func (s *server) startVerseDiscovery(ctx context.Context) {
+	if s.conf.VerseLayer.Discovery.Endpoint == "" {
+		return
+	}
+
+	disc := config.NewVerseDiscovery(
+		http.DefaultClient,
+		s.conf.VerseLayer.Discovery.Endpoint,
+		s.conf.VerseLayer.Discovery.RefreshInterval)
+
+	sub := disc.Subscribe(ctx)
+	defer sub.Cancel()
+
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case verse := <-sub.Next():
+				s.discoveredVerses.Store(verse.ChainID, verse)
+
+				select {
+				case <-ctx.Done():
+					return
+				case s.discoveredNotify <- struct{}{}:
+				}
+			}
+		}
+	}()
+
+	time.Sleep(time.Second)
+	disc.Start(ctx)
+}
+
+func (s *server) setupCollector() {
+	if !s.conf.Verifier.Enable {
+		return
+	}
+
+	_, account := findWallet(s.conf, s.ks, s.conf.Verifier.Wallet)
+
+	s.blockCollector = collector.NewBlockCollector(&s.conf.Verifier, s.db, s.hub)
+	s.eventCollector = collector.NewEventCollector(&s.conf.Verifier, s.db, s.hub, account.Address)
+}
+
+func (s *server) mustSetupVerifier() {
+	if !s.conf.Verifier.Enable {
+		return
+	}
+
+	wallet, account := findWallet(s.conf, s.ks, s.conf.Verifier.Wallet)
+	signer, err := ethutil.NewWritableClient(
+		new(big.Int).SetUint64(s.conf.HubLayer.ChainId), s.conf.HubLayer.RPC, wallet, account)
+	if err != nil {
+		log.Crit("Failed to construct verifier", "err", err)
+	}
+
+	s.verifier = verifierpkg.NewVerifier(&s.conf.Verifier, s.db, signer.SignerContext())
+}
+
+func (s *server) mustSetupSubmitter() {
+	if !s.conf.Submitter.Enable {
+		return
+	}
+
+	sm, err := stakemanager.NewStakemanager(common.HexToAddress(StakeManagerAddress), s.hub)
+	if err != nil {
+		log.Crit("Failed to construct submitter", "err", err)
+	}
+
+	s.submitter = submitterpkg.NewSubmitter(&s.conf.Submitter, s.db, sm)
+}
+
+func (s *server) setupBeacon() {
+	if !s.conf.Beacon.Enable || !s.conf.Verifier.Enable {
+		return
+	}
+
+	_, account := findWallet(s.conf, s.ks, s.conf.Verifier.Wallet)
+	s.bw = beacon.NewBeaconWorker(
+		&s.conf.Beacon,
+		http.DefaultClient,
+		beacon.Beacon{
+			Signer:  account.Address.Hex(),
+			Version: version.SemVer(),
+			PeerID:  s.p2p.PeerID().String(),
+		},
+	)
+}
+
+func (s *server) verseNotifyHandler(ctx context.Context) {
+	s.discoveredVerses.Range(func(key, value any) bool {
+		verse, ok := value.(*config.Verse)
+		if !ok {
+			return true
+		}
+
+		var err error
+
+		// construct rollup contract
+		var scc_ *scc.Scc
+		sccAddr := common.HexToAddress(verse.L1Contracts[SccName])
+		if sccAddr != (common.Address{}) {
+			if scc_, err = scc.NewScc(sccAddr, s.hub); err != nil {
+				log.Error("Failed to construct OasysStateCommitmentChain client", "err", err)
+				return true
+			}
+		}
+		var l2oo_ *l2oo.OasysL2OutputOracle
+		l2ooAddr := common.HexToAddress(verse.L1Contracts[L2OOName])
+		if l2ooAddr != (common.Address{}) {
+			if l2oo_, err = l2oo.NewOasysL2OutputOracle(l2ooAddr, s.hub); err != nil {
+				log.Error("Failed to construct OasysL2OutputOracle client", "err", err)
+				return true
+			}
+		}
+		if scc_ == nil && l2oo_ == nil {
+			return true
+		}
+
+		// add verse to Verifier
+		if s.verifier != nil {
+			l2Client, err := ethutil.NewReadOnlyClient(verse.RPC)
+			if err != nil {
+				log.Error("Failed to construct verse-layer client", "err", err)
+				return true
+			}
+			if scc_ != nil {
+				s.verifier.AddWorker(verifierpkg.NewSccVerifyWorker(l2Client, sccAddr, scc_))
+			}
+			if l2oo_ != nil {
+				s.verifier.AddWorker(verifierpkg.NewL2OOVerifyWorker(l2Client, l2ooAddr, l2oo_))
+			}
+		}
+
+		// add verse to Submitter
+		if s.submitter != nil {
+			for _, t := range s.conf.Submitter.Targets {
+				if t.ChainID != verse.ChainID {
+					continue
+				}
+
+				wallet, account := findWallet(s.conf, s.ks, t.Wallet)
+				l1Client, err := ethutil.NewWritableClient(
+					new(big.Int).SetUint64(s.conf.HubLayer.ChainId), s.conf.HubLayer.RPC, wallet, account)
+				if err != nil {
+					log.Error("Failed to construct hub-layer client", "err", err)
+					return true
+				}
+
+				verifier, err := sccverifier.NewOasysRollupVerifier(
+					common.HexToAddress(s.conf.Submitter.VerifierAddress), l1Client)
+				if err != nil {
+					log.Error("Failed to construct OasysRollupVerifier contract", "err", err)
+					return true
+				}
+
+				var multicall *multicall2.Multicall2
+				if s.conf.Submitter.UseMulticall {
+					multicall, err = multicall2.NewMulticall2(
+						common.HexToAddress(s.conf.Submitter.Multicall2Address), l1Client)
+					if err != nil {
+						log.Error("Failed to construct OasysRollupVerifier contract", "err", err)
+						return true
+					}
+				}
+
+				if scc_ != nil {
+					task, err := submitterpkg.NewTask(
+						l1Client, sccAddr, scc_, verifier, multicall)
+					if err != nil {
+						log.Error("Failed to add SCC contract submit task", "err", err)
+					} else {
+						s.submitter.AddTask(t.ChainID, task)
+					}
+				}
+				if l2oo_ != nil {
+					task, err := submitterpkg.NewTask(
+						l1Client, l2ooAddr, l2oo_, verifier, multicall)
+					if err != nil {
+						log.Error("Failed to add L2OO contract submit task", "err", err)
+					} else {
+						s.submitter.AddTask(t.ChainID, task)
+					}
+				}
+
+				break
+			}
+		}
+
+		return true
+	})
+}
+
+func (s *server) start(ctx context.Context) {
 	// start block collector
-	bkCollector := newBlockCollector(ctx, conf, db, hub)
-	if bkCollector != nil {
-		wg.Add(1)
+	if s.blockCollector != nil {
+		s.wg.Add(1)
 		go func() {
-			defer wg.Done()
-			bkCollector.Start(ctx)
+			defer s.wg.Done()
+			s.blockCollector.Start(ctx)
 		}()
 	}
 
 	// start event collector
-	evCollector := newEventCollector(ctx, conf, db, hub)
-	if evCollector != nil {
-		wg.Add(1)
+	if s.eventCollector != nil {
+		s.wg.Add(1)
 		go func() {
-			defer wg.Done()
-			evCollector.Start(ctx)
+			defer s.wg.Done()
+			s.eventCollector.Start(ctx)
 		}()
 	}
 
-	// Construct the L1 RPC Client
-	wallet, account := findWallet(conf, ks, conf.Verifier.Wallet)
-	l1Client, err := ethutil.NewWritableClient(
-		new(big.Int).SetUint64(conf.HubLayer.ChainId),
-		conf.HubLayer.RPC,
-		wallet,
-		account,
-	)
-	if err != nil {
-		log.Crit("Failed to create hub-layer clinet", "err", err)
+	if s.verifier != nil {
+		// start verifier
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+			s.verifier.Start(ctx)
+		}()
+
+		// start database optimizer
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+
+			tick := util.NewTicker(s.conf.Verifier.OptimizeInterval, 1)
+			defer tick.Stop()
+
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-tick.C:
+					s.db.Optimism.RepairPreviousID(s.verifier.SignerContext().Signer)
+				}
+			}
+		}()
+
+		// publish new signature via p2p
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+
+			sub := s.verifier.SubscribeNewSignature(ctx)
+			defer sub.Cancel()
+
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case sig := <-sub.Next():
+					switch t := sig.(type) {
+					case *database.OptimismSignature:
+						s.p2p.PublishSignatures(ctx, []*database.OptimismSignature{t})
+					case *database.OpstackSignature:
+						// TODO
+					}
+				}
+			}
+		}()
 	}
 
-	// construct state verifier
-	verifier := newVerifier(conf, db, l1Client)
+	// start submitter
+	if s.submitter != nil {
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+			s.submitter.Start(ctx)
+		}()
+	}
 
-	//  start p2p
-	p2p := newP2P(ctx, conf, db, verifier)
-	wg.Add(1)
+	// start verse discovery
+	s.wg.Add(1)
 	go func() {
-		defer wg.Done()
-		p2p.Start(ctx)
+		defer s.wg.Done()
+		s.startVerseDiscovery(ctx)
 	}()
 
-	// start state verifier
-	if verifier != nil {
-		wg.Add(1)
+	// start verse handler
+	if s.verifier != nil || s.submitter != nil {
+		for _, verse := range s.conf.VerseLayer.Directs {
+			s.discoveredVerses.Store(verse.ChainID, verse)
+		}
 		go func() {
-			defer wg.Done()
-			startVerifier(ctx, conf, db, l1Client, verifier, p2p)
+			s.discoveredNotify <- struct{}{}
+		}()
+
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-s.discoveredNotify:
+					s.verseNotifyHandler(ctx)
+				}
+			}
 		}()
 	}
 
 	// start beacon worker
-	if verifier != nil && conf.Beacon.Enable {
-		wg.Add(1)
+	if s.bw != nil {
+		s.wg.Add(1)
 		go func() {
-			defer wg.Done()
-			bw := beacon.NewBeaconWorker(
-				&conf.Beacon,
-				http.DefaultClient,
-				beacon.Beacon{
-					Signer:  verifier.SignerContext().Signer.String(),
-					Version: version.SemVer(),
-					PeerID:  p2p.PeerID().String(),
-				},
-			)
-			bw.Start(ctx)
+			defer s.wg.Done()
+			s.bw.Start(ctx)
 		}()
 	}
-
-	// start signature submitter
-	submitter := newSubmitter(ctx, conf, ks, db, hub)
-	if submitter != nil {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			submitter.Start(ctx)
-		}()
-	}
-
-	// start verse discovery worker
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		startVerseDiscovery(ctx, conf, ks, l1Client, verifier, submitter)
-	}()
-
-	wg.Wait()
-	log.Info("Stopped all workers")
 }
 
 func getOrCreateP2PKey(filename string) (crypto.PrivKey, error) {
@@ -275,351 +609,6 @@ func waitForUnlockWallets(ctx context.Context, c *config.Config, ks *wallet.KeyS
 			log.Info("Wallet unlocked", "name", name, "address", wallet.Address)
 		}(name, wallet)
 	}
-
-	wg.Wait()
-}
-
-func newIPC(c *config.Config, ks *wallet.KeyStore) *ipc.IPCServer {
-	if !c.IPC.Enable {
-		return nil
-	}
-
-	ipc, err := ipc.NewIPCServer(commandName)
-	if err != nil {
-		log.Crit("Failed to create ipc server", "err", err)
-	}
-
-	ipc.SetHandler(ipccmd.WalletUnlockCmd.NewHandler(ks))
-	return ipc
-}
-
-func newP2P(
-	ctx context.Context,
-	c *config.Config,
-	db *database.Database,
-	verifier *verifierpkg.Verifier,
-) *p2p.Node {
-	// get p2p private key
-	p2pKey, err := getOrCreateP2PKey(c.P2PKeyPath())
-	if err != nil {
-		log.Crit(err.Error())
-	}
-
-	// setup p2p node
-	listens := strings.Split(c.P2P.Listen, ":")
-	host, dht, bwm, err := p2p.NewHost(ctx, listens[0], listens[1], p2pKey)
-	if err != nil {
-		log.Crit(err.Error())
-	}
-
-	// connect to bootstrap peers and setup peer discovery
-	p2p.Bootstrap(ctx, host, dht)
-	bootstrapPeers := p2p.ConvertPeers(c.P2P.Bootnodes)
-	if len(bootstrapPeers) > 0 {
-		go func() {
-			ticker := util.NewTicker(time.Minute, 1)
-			defer ticker.Stop()
-
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case <-ticker.C:
-					p2p.ConnectPeers(ctx, host, bootstrapPeers)
-				}
-			}
-		}()
-	}
-
-	// ignore self-signed signatures
-	ignoreSigners := []common.Address{}
-	if verifier != nil {
-		ignoreSigners = append(ignoreSigners, verifier.SignerContext().Signer)
-	}
-
-	node, err := p2p.NewNode(&c.P2P, db, host, dht, bwm, c.HubLayer.ChainId, ignoreSigners)
-	if err != nil {
-		log.Crit("Failed to create p2p server", "err", err)
-	}
-
-	return node
-}
-
-func newBlockCollector(
-	ctx context.Context,
-	c *config.Config,
-	db *database.Database,
-	hub ethutil.ReadOnlyClient,
-) *collector.BlockCollector {
-	if !c.Verifier.Enable {
-		return nil
-	}
-
-	return collector.NewBlockCollector(&c.Verifier, db, hub)
-}
-
-func newEventCollector(
-	ctx context.Context,
-	c *config.Config,
-	db *database.Database,
-	hub ethutil.ReadOnlyClient,
-) *collector.EventCollector {
-	if !c.Verifier.Enable {
-		return nil
-	}
-
-	return collector.NewEventCollector(
-		&c.Verifier, db, hub,
-		common.HexToAddress(c.Wallets[c.Verifier.Wallet].Address),
-	)
-}
-
-func newVerifier(c *config.Config, db *database.Database, l1Client ethutil.WritableClient) *verifierpkg.Verifier {
-	if !c.Verifier.Enable {
-		return nil
-	}
-	return verifierpkg.NewVerifier(&c.Verifier, db, l1Client.SignerContext())
-}
-
-func newSubmitter(
-	ctx context.Context,
-	c *config.Config,
-	ks *wallet.KeyStore,
-	db *database.Database,
-	hub ethutil.ReadOnlyClient,
-) *submitterpkg.Submitter {
-	if !c.Submitter.Enable {
-		return nil
-	}
-
-	sm, err := stakemanager.NewStakemanager(common.HexToAddress(StakeManagerAddress), hub)
-	if err != nil {
-		log.Crit("Failed to create StakeManager", "err", err)
-	}
-
-	return submitterpkg.NewSubmitter(&c.Submitter, db, sm)
-}
-
-func startVerseDiscovery(
-	ctx context.Context,
-	c *config.Config,
-	ks *wallet.KeyStore,
-	l1Client ethutil.ReadOnlyClient,
-	verifier *verifierpkg.Verifier,
-	submitter *submitterpkg.Submitter,
-) {
-	if !c.Verifier.Enable && !c.Submitter.Enable {
-		return
-	}
-
-	notify := make(chan struct{}, 1)
-	verses := &sync.Map{}
-	for _, v := range c.VerseLayer.Directs {
-		verses.Store(v.ChainID, v)
-	}
-	notify <- struct{}{}
-
-	go func() {
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-notify:
-				verses.Range(func(key, value any) bool {
-					verse, ok := value.(*config.Verse)
-					if !ok {
-						return true
-					}
-
-					// get contract address and construct rollup contracts
-					var (
-						sccAddr, l2ooAddr common.Address
-						scc_              *scc.Scc
-						l2oo_             *l2oo.OasysL2OutputOracle
-						err               error
-					)
-					if s, ok := verse.L1Contracts[SccName]; ok {
-						sccAddr = common.HexToAddress(s)
-						if scc_, err = scc.NewScc(sccAddr, l1Client); err != nil {
-							log.Error("Failed to construct OasysStateCommitmentChain client", "err", err)
-							return true
-						}
-					}
-					if s, ok := verse.L1Contracts[L2OOName]; ok {
-						l2ooAddr = common.HexToAddress(s)
-						if l2oo_, err = l2oo.NewOasysL2OutputOracle(l2ooAddr, l1Client); err != nil {
-							log.Error("Failed to construct OasysL2OutputOracle client", "err", err)
-							return true
-						}
-					}
-
-					// add verse to Verifier
-					if c.Verifier.Enable {
-						l2Client, err := ethutil.NewReadOnlyClient(verse.RPC)
-						if err != nil {
-							log.Error("Failed to create verse-layer client", "err", err)
-							return true
-						}
-
-						if scc_ != nil {
-							verifier.AddWorker(verifierpkg.NewSccVerifyWorker(l2Client, sccAddr, scc_))
-						}
-						if l2oo_ != nil {
-							verifier.AddWorker(verifierpkg.NewL2OOVerifyWorker(l2Client, l2ooAddr, l2oo_))
-						}
-					}
-
-					// add verse to Submitter
-					if c.Submitter.Enable {
-						for _, t := range c.Submitter.Targets {
-							if t.ChainID != verse.ChainID {
-								continue
-							}
-
-							wallet, account := findWallet(c, ks, t.Wallet)
-							l1Client, err := ethutil.NewWritableClient(
-								new(big.Int).SetUint64(c.HubLayer.ChainId),
-								c.HubLayer.RPC,
-								wallet,
-								account,
-							)
-							if err != nil {
-								log.Error("Failed to construct hub-layer client", "err", err)
-								return true
-							}
-
-							verifier, err := sccverifier.NewOasysRollupVerifier(
-								common.HexToAddress(c.Submitter.VerifierAddress), l1Client)
-							if err != nil {
-								log.Error("Failed to construct OasysRollupVerifier contract", "err", err)
-								return true
-							}
-
-							var multicall *multicall2.Multicall2
-							if c.Submitter.UseMulticall {
-								multicall, err = multicall2.NewMulticall2(
-									common.HexToAddress(c.Submitter.Multicall2Address), l1Client)
-								if err != nil {
-									log.Error("Failed to construct OasysRollupVerifier contract", "err", err)
-									return true
-								}
-							}
-
-							if scc_ != nil {
-								task, err := submitterpkg.NewTask(
-									l1Client, sccAddr, scc_, verifier, multicall)
-								if err != nil {
-									log.Error("Failed to add SCC contract submit task", "err", err)
-								} else {
-									submitter.AddTask(t.ChainID, task)
-								}
-							}
-							if l2oo_ != nil {
-								task, err := submitterpkg.NewTask(
-									l1Client, l2ooAddr, l2oo_, verifier, multicall)
-								if err != nil {
-									log.Error("Failed to add L2OO contract submit task", "err", err)
-								} else {
-									submitter.AddTask(t.ChainID, task)
-								}
-							}
-
-							break
-						}
-					}
-
-					return true
-				})
-			}
-		}
-	}()
-
-	if c.VerseLayer.Discovery.Endpoint == "" {
-		return
-	}
-
-	// start verse discovery
-	discv := config.NewVerseDiscovery(
-		http.DefaultClient,
-		c.VerseLayer.Discovery.Endpoint,
-		c.VerseLayer.Discovery.RefreshInterval,
-	)
-
-	go func() {
-		sub := discv.Subscribe(ctx)
-		defer sub.Cancel()
-
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case verse := <-sub.Next():
-				verses.Store(verse.ChainID, verse)
-				notify <- struct{}{}
-			}
-		}
-	}()
-
-	time.Sleep(1 * time.Second)
-	discv.Start(ctx)
-}
-
-func startVerifier(
-	ctx context.Context,
-	c *config.Config,
-	db *database.Database,
-	l1Client ethutil.WritableClient,
-	verifier *verifierpkg.Verifier,
-	p2p *p2p.Node,
-) {
-	wg := &sync.WaitGroup{}
-
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		verifier.Start(ctx)
-	}()
-
-	// optimize database every hour
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-
-		tick := util.NewTicker(c.Verifier.OptimizeInterval, 1)
-		defer tick.Stop()
-
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-tick.C:
-				db.Optimism.RepairPreviousID(l1Client.Signer())
-			}
-		}
-	}()
-
-	// publish new signature via p2p
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-
-		sub := verifier.SubscribeNewSignature(ctx)
-		defer sub.Cancel()
-
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case sig := <-sub.Next():
-				switch t := sig.(type) {
-				case *database.OptimismSignature:
-					p2p.PublishSignatures(ctx, []*database.OptimismSignature{t})
-				case *database.OpstackSignature:
-					// TODO
-				}
-			}
-		}
-	}()
 
 	wg.Wait()
 }

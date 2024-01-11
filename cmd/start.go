@@ -472,9 +472,9 @@ func (s *server) start(ctx context.Context) {
 				case sig := <-sub.Next():
 					switch t := sig.(type) {
 					case *database.OptimismSignature:
-						s.p2p.PublishSignatures(ctx, []*database.OptimismSignature{t})
+						s.p2p.PublishSignatures(ctx, []*database.OptimismSignature{t}, nil)
 					case *database.OpstackSignature:
-						// TODO
+						s.p2p.PublishSignatures(ctx, nil, []*database.OpstackSignature{t})
 					}
 				}
 			}

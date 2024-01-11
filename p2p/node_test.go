@@ -140,11 +140,11 @@ func (s *NodeTestSuite) TestHandleOptimismSignatureExchangeFromPubSub() {
 	}
 	cases := []*testcase{
 		{
-			toProtoBufSig(s.sigs[s.signer0][s.scc1][99]),
+			optimismSignatures(s.sigs[s.signer0][s.scc1]).toProtoBufSig()[99],
 			want{s.signer0, s.sigs[s.signer0][s.scc1][99].ID},
 		},
 		{
-			toProtoBufSig(s.sigs[s.signer1][s.scc1][199]),
+			optimismSignatures(s.sigs[s.signer1][s.scc1]).toProtoBufSig()[199],
 			want{s.signer1, s.sigs[s.signer1][s.scc1][199].ID},
 		},
 		{
@@ -206,7 +206,8 @@ func (s *NodeTestSuite) TestHandleOptimismSignatureExchangeFromPubSub() {
 
 	// publish message
 	for _, tt := range cases {
-		go s.node1.handleOptimismSignatureExchangeFromPubSub(ctx, s.node2.h.ID(), tt.msg)
+		go s.node1.handleSignatureExchangeFromPubSub(
+			ctx, &optimismDatabase{db: s.node1.db.Optimism}, s.node2.h.ID(), tt.msg)
 		time.Sleep(time.Millisecond * 50)
 	}
 	<-ctx.Done()

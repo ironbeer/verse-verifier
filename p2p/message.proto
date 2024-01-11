@@ -5,10 +5,9 @@ package message;
 option go_package = "./pb";
 
 message PubSub {
-  oneof body {
-    bytes misc = 1;
-    OptimismSignatureExchange optimism_signature_exchange = 2;
-  }
+  optional bytes misc = 1;
+  optional OptimismSignatureExchange optimism_signature_exchange = 2;
+  optional OpstackSignatureExchange opstack_signature_exchange = 3; // Added
 }
 
 message Stream {
@@ -17,6 +16,8 @@ message Stream {
     bytes eom = 2;
     OptimismSignatureExchange optimism_signature_exchange = 3;
     FindCommonOptimismSignature find_common_optimism_signature = 4;
+    OpstackSignatureExchange opstack_signature_exchange = 5;      // Added
+    FindCommonOpstackSignature find_common_opstack_signature = 6; // Added
   }
 }
 
@@ -34,6 +35,19 @@ message OptimismSignature {
   bytes signature = 11;
 }
 
+message OpstackSignature {
+  string id = 1;
+  string previous_id = 2;
+  bytes signer = 3;
+  bytes l2oo = 4;
+  uint64 l2_output_index = 5;
+  bytes output_root = 6;
+  uint64 l2_block_number = 7;
+  uint64 l1_timestamp = 8;
+  bool approved = 9;
+  bytes signature = 10;
+}
+
 message OptimismSignatureExchange {
   repeated OptimismSignature latests = 1;
   repeated Request requests = 2;
@@ -45,9 +59,30 @@ message OptimismSignatureExchange {
   }
 }
 
+message OpstackSignatureExchange {
+  repeated OpstackSignature latests = 1;
+  repeated Request requests = 2;
+  repeated OpstackSignature responses = 3;
+
+  message Request {
+    bytes signer = 1;
+    string id_after = 2;
+  }
+}
+
 message FindCommonOptimismSignature {
   repeated Local locals = 1;
   optional OptimismSignature found = 2;
+
+  message Local {
+    string id = 1;
+    string previous_id = 2;
+  }
+}
+
+message FindCommonOpstackSignature {
+  repeated Local locals = 1;
+  optional OpstackSignature found = 2;
 
   message Local {
     string id = 1;

@@ -23,7 +23,6 @@ import (
 	"github.com/oasysgames/oasys-optimism-verifier/database"
 	"github.com/oasysgames/oasys-optimism-verifier/p2p/pb"
 	"github.com/oasysgames/oasys-optimism-verifier/util"
-	"github.com/oasysgames/oasys-optimism-verifier/verifier"
 	"github.com/oklog/ulid/v2"
 	"google.golang.org/protobuf/proto"
 )
@@ -138,14 +137,14 @@ func (w *Node) publishLoop(ctx context.Context) {
 func (w *Node) subscribeLoop(ctx context.Context) {
 	type Job struct {
 		from   peer.ID
-		db     signatureDatabase
-		remote pbSignature
+		db     *signatureDB
+		remote pb.ISignature
 	}
 
 	wg := util.NewWorkerGroup(100) // each signer address
 	running := &sync.Map{}         // stores IDs in process for each signer
-	optimismDB := &optimismDatabase{db: w.db.Optimism}
-	opstackDB := &opstackDatabase{db: w.db.OPStack}
+	optimismDB := &signatureDB{&wrappedOptimismDB{w.db.Optimism}}
+	opstackDB := &signatureDB{&wrappedOpstackDB{w.db.OPStack}}
 
 	for {
 		from, msg, err := subscribe(ctx, w.sub, w.h.ID())
@@ -221,8 +220,8 @@ func (w *Node) handleStream(s network.Stream) {
 	defer closeStream(s)
 
 	peer := s.Conn().RemotePeer()
-	optimismDB := &optimismDatabase{db: w.db.Optimism}
-	opstackDB := &opstackDatabase{db: w.db.OPStack}
+	optimismDB := &signatureDB{&wrappedOptimismDB{w.db.Optimism}}
+	opstackDB := &signatureDB{&wrappedOpstackDB{w.db.OPStack}}
 
 	for {
 		m, err := readStreamWithTimeout(context.Background(), s, w.cfg.StreamTimeout)
@@ -235,10 +234,10 @@ func (w *Node) handleStream(s network.Stream) {
 		}
 
 		var (
-			db     signatureDatabase
-			exReqs []pbSignatureRequest
-			exRess []pbSignature
-			fcReqs []pbCommonSignatureRequest
+			db     *signatureDB
+			exReqs []pb.ISignatureRequest
+			exRess []pb.ISignature
+			fcReqs []pb.ICommonSignatureRequest
 		)
 		switch t := m.Body.(type) {
 		case *pb.Stream_OptimismSignatureExchange:
@@ -283,11 +282,9 @@ func (w *Node) handleStream(s network.Stream) {
 
 		if len(exReqs) > 0 {
 			w.handleSignatureExchangeRequests(db, s, exReqs)
-		}
-		if len(exRess) > 0 {
+		} else if len(exRess) > 0 {
 			w.handleSignatureExchangeResponses(db, s, exRess)
-		}
-		if len(fcReqs) > 0 {
+		} else if len(fcReqs) > 0 {
 			w.handleFindCommonSignatureRequests(db, s, fcReqs)
 		}
 	}
@@ -295,9 +292,9 @@ func (w *Node) handleStream(s network.Stream) {
 
 func (w *Node) handleSignatureExchangeFromPubSub(
 	ctx context.Context,
-	db signatureDatabase,
+	db *signatureDB,
 	sender peer.ID,
-	remote pbSignature,
+	remote pb.ISignature,
 ) {
 	signer := common.BytesToAddress(remote.GetSigner())
 	logctx := []interface{}{
@@ -308,8 +305,12 @@ func (w *Node) handleSignatureExchangeFromPubSub(
 		// "index", remote.BatchIndex, // TODO
 	}
 
+	if err := verifyULID(remote.GetId()); err != nil {
+		w.log.Error("Invalid signature id", append(logctx, "err", err)...)
+		return
+	}
 	if ok, err := db.verifySignature(w.hubLayerChainID, remote); err != nil || !ok {
-		w.log.Error("Invalid signature", append(logctx, "verify", ok, "err", err)...)
+		w.log.Error("Invalid signature", append(logctx, "err", err)...)
 		return
 	}
 	if _, ok := w.ignoreSigners[signer]; ok {
@@ -380,9 +381,9 @@ func (w *Node) handleSignatureExchangeFromPubSub(
 }
 
 func (w *Node) handleSignatureExchangeRequests(
-	db signatureDatabase,
+	db *signatureDB,
 	s network.Stream,
-	reqs []pbSignatureRequest,
+	reqs []pb.ISignatureRequest,
 ) {
 	for _, req := range reqs {
 		signer := common.BytesToAddress(req.GetSigner())
@@ -413,9 +414,9 @@ func (w *Node) handleSignatureExchangeRequests(
 }
 
 func (w *Node) handleSignatureExchangeResponses(
-	db signatureDatabase,
+	db *signatureDB,
 	s network.Stream,
-	ress []pbSignature,
+	ress []pb.ISignature,
 ) {
 	for _, res := range ress {
 		signer := common.BytesToAddress(res.GetSigner())
@@ -425,8 +426,12 @@ func (w *Node) handleSignatureExchangeResponses(
 		// scc := common.BytesToAddress(res.Scc) // TODO
 		logctx := []interface{}{"signer", signer, "id", id, "previous-id", previousId}
 
+		if err := verifyULID(res.GetId()); err != nil {
+			w.log.Error("Invalid signature id", append(logctx, "err", err)...)
+			return
+		}
 		if ok, err := db.verifySignature(w.hubLayerChainID, res); !ok || err != nil {
-			w.log.Error("Invalid signature", append(logctx, "verify", ok, "err", err)...)
+			w.log.Error("Invalid signature", append(logctx, "err", err)...)
 			return
 		}
 		if _, ok := w.ignoreSigners[signer]; ok {
@@ -459,9 +464,9 @@ func (w *Node) handleSignatureExchangeResponses(
 }
 
 func (w *Node) handleFindCommonSignatureRequests(
-	db signatureDatabase,
+	db *signatureDB,
 	s network.Stream,
-	reqs []pbCommonSignatureRequest,
+	reqs []pb.ICommonSignatureRequest,
 ) {
 	var (
 		res   *pb.Stream
@@ -491,10 +496,10 @@ func (w *Node) handleFindCommonSignatureRequests(
 
 // Find the latest signature of the same ID and PreviousID from peer
 func (w *Node) findCommonLatestSignature(
-	db signatureDatabase,
+	db *signatureDB,
 	s network.Stream,
-	remote pbSignature,
-) (pbSignature, error) {
+	remote pb.ISignature,
+) (pb.ISignature, error) {
 	signer := common.BytesToAddress(remote.GetSigner())
 	limit, offset := 100, 0
 	for {
@@ -530,14 +535,13 @@ func (w *Node) findCommonLatestSignature(
 			return nil, err
 		}
 
-		found, err := db.handleFindCommonSignatureResponse(res)
+		sig, found, err := db.handleFindCommonSignatureResponse(res)
 		if err != nil {
 			w.log.Error(err.Error(), logctx...)
 			return nil, err
 		}
-		if found != nil {
-			// found!
-			return found, nil
+		if found {
+			return sig, nil
 		}
 
 		offset += limit
@@ -561,18 +565,18 @@ func (w *Node) publishLatestSignatures(ctx context.Context) {
 
 func (w *Node) PublishSignatures(
 	ctx context.Context,
-	optimisms optimismSignatures,
-	opstacks opstackSignatures,
+	optimisms wrappedOptimismSignatures,
+	opstacks wrappedOpstackSignatures,
 ) {
 	var msg pb.PubSub
 	if len(optimisms) > 0 {
 		msg.OptimismSignatureExchange = &pb.OptimismSignatureExchange{
-			Latests: optimisms.toProtoBufSig(),
+			Latests: optimisms.ProtoSig(),
 		}
 	}
 	if len(opstacks) > 0 {
 		msg.OpstackSignatureExchange = &pb.OpstackSignatureExchange{
-			Latests: opstacks.toProtoBufSig(),
+			Latests: opstacks.ProtoSig(),
 		}
 	}
 	if msg.OptimismSignatureExchange == nil && msg.OpstackSignatureExchange == nil {
@@ -705,356 +709,4 @@ func verifyULID(id string) error {
 		return fmt.Errorf("future ulid: %s, timestamp: %d", id, ulid.Time())
 	}
 	return nil
-}
-
-type optimismSignatures []*database.OptimismSignature
-
-func (sigs optimismSignatures) toProtoBufSig() (pbSigs []*pb.OptimismSignature) {
-	for _, s := range sigs {
-		pbSigs = append(pbSigs, &pb.OptimismSignature{
-			Id:                s.ID,
-			PreviousId:        s.PreviousID,
-			Signer:            s.Signer.Address[:],
-			Scc:               s.OptimismScc.Address[:],
-			BatchIndex:        s.BatchIndex,
-			BatchRoot:         s.BatchRoot[:],
-			BatchSize:         s.BatchSize,
-			PrevTotalElements: s.PrevTotalElements,
-			ExtraData:         s.ExtraData,
-			Approved:          s.Approved,
-			Signature:         s.Signature[:],
-		})
-	}
-	return pbSigs
-}
-
-type opstackSignatures []*database.OpstackSignature
-
-func (sigs opstackSignatures) toProtoBufSig() (pbSigs []*pb.OpstackSignature) {
-	for _, s := range sigs {
-		pbSigs = append(pbSigs, &pb.OpstackSignature{
-			Id:            s.ID,
-			PreviousId:    s.PreviousID,
-			Signer:        s.Signer.Address[:],
-			L2Oo:          s.OpstackL2OutputOracle.Address[:],
-			L2OutputIndex: s.L2OutputIndex,
-			OutputRoot:    s.OutputRoot[:],
-			L2BlockNumber: s.L2BlockNumber,
-			L1Timestamp:   s.L1Timestamp,
-			Approved:      s.Approved,
-			Signature:     s.Signature[:],
-		})
-	}
-	return pbSigs
-}
-
-type pbSignature interface {
-	GetId() string         // signature id
-	GetPreviousId() string // previous signature id
-	GetSigner() []byte     // signer address
-}
-
-type pbSignatureRequest interface {
-	GetIdAfter() string // signature id
-	GetSigner() []byte  // signer address
-}
-
-type pbCommonSignatureRequest interface {
-	GetId() string         // signature id
-	GetPreviousId() string // previous signature id
-}
-
-type signatureDatabase interface {
-	findLatestSignatureId(signer common.Address) (id string, err error)
-	getSignatureExchangeRequest(signer common.Address, idAfter string) *pb.Stream
-	getSignatureExchangeResponse(signer common.Address, idAfter string, limit, offset int) (msg *pb.Stream, count int, err error)
-	hasSignature(id string, previousID *string) (bool, error)
-	getFindCommonSignatureRequest(signer common.Address, limit, offset int) (msg *pb.Stream, from, to string, err error)
-	getFindCommonSignatureResponse(req pbCommonSignatureRequest) (msg *pb.Stream, found bool, err error)
-	handleFindCommonSignatureResponse(res *pb.Stream) (pbSignature, error)
-	saveSignature(pbMsg interface{}) error
-	verifySignature(hubLayerChainID *big.Int, pbMsg interface{}) (bool, error)
-}
-
-type optimismDatabase struct {
-	db *database.OptimismDatabase
-}
-
-func (w *optimismDatabase) findLatestSignatureId(signer common.Address) (id string, err error) {
-	latests, err := w.db.FindLatestSignaturesBySigner(signer, 1, 0)
-	if err != nil {
-		return "", err
-	} else if len(latests) == 0 {
-		return "", nil
-	}
-	return latests[0].ID, nil
-}
-
-func (w *optimismDatabase) getSignatureExchangeRequest(signer common.Address, idAfter string) *pb.Stream {
-	return &pb.Stream{Body: &pb.Stream_OptimismSignatureExchange{
-		OptimismSignatureExchange: &pb.OptimismSignatureExchange{
-			Requests: []*pb.OptimismSignatureExchange_Request{
-				{
-					Signer:  signer[:],
-					IdAfter: idAfter,
-				},
-			},
-		},
-	}}
-}
-
-func (w *optimismDatabase) getSignatureExchangeResponse(signer common.Address, idAfter string, limit, offset int) (msg *pb.Stream, count int, err error) {
-	// get latest signatures for each requested signer
-	sigs, err := w.db.FindSignatures(&idAfter, &signer, nil, nil, limit, offset)
-	if err != nil {
-		return nil, 0, err
-	}
-	return &pb.Stream{Body: &pb.Stream_OptimismSignatureExchange{
-		OptimismSignatureExchange: &pb.OptimismSignatureExchange{
-			Responses: optimismSignatures(sigs).toProtoBufSig(),
-		},
-	}}, len(sigs), nil
-}
-
-func (w *optimismDatabase) hasSignature(id string, previousID *string) (bool, error) {
-	sig, err := w.db.FindSignatureByID(id)
-	if errors.Is(err, database.ErrNotFound) {
-		return false, nil
-	} else if err != nil {
-		return false, err
-	} else if previousID == nil {
-		return true, nil
-	}
-	return sig.PreviousID == *previousID, nil
-}
-
-func (w *optimismDatabase) getFindCommonSignatureRequest(
-	signer common.Address,
-	limit, offset int,
-) (msg *pb.Stream, from, to string, err error) {
-	// find local latest signatures (order by: id desc)
-	sigs, err := w.db.FindLatestSignaturesBySigner(signer, limit, offset)
-	if err != nil {
-		return nil, "", "", err
-	} else if len(sigs) == 0 {
-		// reached the last
-		return nil, "", "", nil
-	}
-
-	// construct protobuf message
-	locals := make([]*pb.FindCommonOptimismSignature_Local, len(sigs))
-	for i, sig := range sigs {
-		locals[i] = &pb.FindCommonOptimismSignature_Local{
-			Id:         sig.ID,
-			PreviousId: sig.PreviousID,
-		}
-	}
-
-	return &pb.Stream{Body: &pb.Stream_FindCommonOptimismSignature{
-		FindCommonOptimismSignature: &pb.FindCommonOptimismSignature{Locals: locals},
-	}}, sigs[0].ID, sigs[len(sigs)-1].ID, nil
-}
-
-func (w *optimismDatabase) getFindCommonSignatureResponse(req pbCommonSignatureRequest) (msg *pb.Stream, found bool, err error) {
-	var pbSig *pb.OptimismSignature
-	sig, err := w.db.FindSignatureByID(req.GetId())
-	if err == nil && sig.PreviousID == req.GetPreviousId() {
-		pbSig = optimismSignatures{sig}.toProtoBufSig()[0]
-		found = true
-	}
-
-	return &pb.Stream{Body: &pb.Stream_FindCommonOptimismSignature{
-		FindCommonOptimismSignature: &pb.FindCommonOptimismSignature{Found: pbSig},
-	}}, found, err
-}
-
-func (w *optimismDatabase) handleFindCommonSignatureResponse(res *pb.Stream) (pbSignature, error) {
-	t := res.GetFindCommonOptimismSignature()
-	if t == nil {
-		return nil, errors.New("unexpected response")
-	} else if t.Found == nil {
-		return nil, nil
-	}
-	return t.Found, nil
-}
-
-func (w *optimismDatabase) saveSignature(pbMsg interface{}) error {
-	sig, ok := pbMsg.(*pb.OptimismSignature)
-	if !ok {
-		return errors.New("unknown protobuf message")
-	}
-
-	_, err := w.db.SaveSignature(
-		&sig.Id,
-		&sig.PreviousId,
-		common.BytesToAddress(sig.Signer),
-		common.BytesToAddress(sig.Scc),
-		sig.BatchIndex,
-		common.BytesToHash(sig.BatchRoot),
-		sig.BatchSize,
-		sig.PrevTotalElements,
-		sig.ExtraData,
-		sig.Approved,
-		database.BytesSignature(sig.Signature))
-	return err
-}
-
-func (w *optimismDatabase) verifySignature(hubLayerChainID *big.Int, pbMsg interface{}) (bool, error) {
-	sig := pbMsg.(*pb.OptimismSignature)
-	if sig == nil {
-		return false, errors.New("not an optimism signature")
-	}
-	if err := verifyULID(sig.Id); err != nil {
-		return false, err
-	}
-
-	msg := verifier.NewSccMessage(
-		hubLayerChainID,
-		common.BytesToAddress(sig.Scc),
-		new(big.Int).SetUint64(sig.BatchIndex),
-		common.BytesToHash(sig.BatchRoot),
-		sig.Approved)
-	return msg.VerifySigner(sig.Signature, common.BytesToAddress(sig.Signer))
-}
-
-type opstackDatabase struct {
-	db *database.OPStackDatabase
-}
-
-func (w *opstackDatabase) findLatestSignatureId(signer common.Address) (id string, err error) {
-	latests, err := w.db.FindLatestSignaturesBySigner(signer, 1, 0)
-	if err != nil {
-		return "", err
-	} else if len(latests) == 0 {
-		return "", nil
-	}
-	return latests[0].ID, nil
-}
-
-func (w *opstackDatabase) getSignatureExchangeRequest(signer common.Address, idAfter string) *pb.Stream {
-	return &pb.Stream{Body: &pb.Stream_OpstackSignatureExchange{
-		OpstackSignatureExchange: &pb.OpstackSignatureExchange{
-			Requests: []*pb.OpstackSignatureExchange_Request{
-				{
-					Signer:  signer[:],
-					IdAfter: idAfter,
-				},
-			},
-		},
-	}}
-}
-
-func (w *opstackDatabase) getSignatureExchangeResponse(signer common.Address, idAfter string, limit, offset int) (msg *pb.Stream, count int, err error) {
-	// get latest signatures for each requested signer
-	sigs, err := w.db.FindSignatures(&idAfter, &signer, nil, nil, limit, offset)
-	if err != nil {
-		return nil, 0, err
-	}
-	return &pb.Stream{Body: &pb.Stream_OpstackSignatureExchange{
-		OpstackSignatureExchange: &pb.OpstackSignatureExchange{
-			Responses: opstackSignatures(sigs).toProtoBufSig(),
-		},
-	}}, len(sigs), nil
-}
-
-func (w *opstackDatabase) hasSignature(id string, previousID *string) (bool, error) {
-	sig, err := w.db.FindSignatureByID(id)
-	if errors.Is(err, database.ErrNotFound) {
-		return false, nil
-	} else if err != nil {
-		return false, err
-	} else if previousID == nil {
-		return true, nil
-	}
-	return sig.PreviousID == *previousID, nil
-}
-
-func (w *opstackDatabase) getFindCommonSignatureRequest(
-	signer common.Address,
-	limit, offset int,
-) (msg *pb.Stream, from, to string, err error) {
-	// find local latest signatures (order by: id desc)
-	sigs, err := w.db.FindLatestSignaturesBySigner(signer, limit, offset)
-	if err != nil {
-		return nil, "", "", err
-	} else if len(sigs) == 0 {
-		// reached the last
-		return nil, "", "", nil
-	}
-
-	// construct protobuf message
-	locals := make([]*pb.FindCommonOpstackSignature_Local, len(sigs))
-	for i, sig := range sigs {
-		locals[i] = &pb.FindCommonOpstackSignature_Local{
-			Id:         sig.ID,
-			PreviousId: sig.PreviousID,
-		}
-	}
-
-	return &pb.Stream{Body: &pb.Stream_FindCommonOpstackSignature{
-		FindCommonOpstackSignature: &pb.FindCommonOpstackSignature{Locals: locals},
-	}}, sigs[0].ID, sigs[len(sigs)-1].ID, nil
-}
-
-func (w *opstackDatabase) getFindCommonSignatureResponse(req pbCommonSignatureRequest) (msg *pb.Stream, found bool, err error) {
-	var pbSig *pb.OpstackSignature
-	sig, err := w.db.FindSignatureByID(req.GetId())
-	if err == nil && sig.PreviousID == req.GetPreviousId() {
-		pbSig = opstackSignatures{sig}.toProtoBufSig()[0]
-		found = true
-	}
-
-	return &pb.Stream{Body: &pb.Stream_FindCommonOpstackSignature{
-		FindCommonOpstackSignature: &pb.FindCommonOpstackSignature{Found: pbSig},
-	}}, found, err
-}
-
-func (w *opstackDatabase) handleFindCommonSignatureResponse(res *pb.Stream) (pbSignature, error) {
-	t := res.GetFindCommonOpstackSignature()
-	if t == nil {
-		return nil, errors.New("unexpected response")
-	} else if t.Found == nil {
-		return nil, nil
-	}
-	return t.Found, nil
-}
-
-func (w *opstackDatabase) saveSignature(pbMsg interface{}) error {
-	t, ok := pbMsg.(*pb.OpstackSignature)
-	if !ok {
-		return errors.New("unknown protobuf message")
-	}
-
-	_, err := w.db.SaveSignature(
-		&t.Id,
-		&t.PreviousId,
-		common.BytesToAddress(t.Signer),
-		common.BytesToAddress(t.L2Oo),
-		t.L2OutputIndex,
-		common.BytesToHash(t.OutputRoot),
-		t.L2BlockNumber,
-		t.L1Timestamp,
-		t.Approved,
-		database.BytesSignature(t.Signature))
-	return err
-}
-
-func (w *opstackDatabase) verifySignature(hubLayerChainID *big.Int, pbMsg interface{}) (bool, error) {
-	sig := pbMsg.(*pb.OpstackSignature)
-	if sig == nil {
-		return false, errors.New("not an opstack signature")
-	}
-	if err := verifyULID(sig.Id); err != nil {
-		return false, err
-	}
-
-	msg := verifier.NewL2ooMessage(
-		hubLayerChainID,
-		common.BytesToAddress(sig.L2Oo),
-		new(big.Int).SetUint64(sig.L2OutputIndex),
-		common.BytesToHash(sig.OutputRoot),
-		new(big.Int).SetUint64(sig.L1Timestamp),
-		new(big.Int).SetUint64(sig.L2BlockNumber),
-		sig.Approved)
-	return msg.VerifySigner(sig.Signature, common.BytesToAddress(sig.Signer))
 }

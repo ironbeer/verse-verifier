@@ -17,28 +17,70 @@ var (
 
 	defaults = map[string]interface{}{
 		"verse_layer.discovery.refresh_interval": time.Hour,
-		"p2p.publish_interval":                   5 * time.Minute,
-		"p2p.stream_timeout":                     15 * time.Second,
-		"verifier.interval":                      15 * time.Second,
-		"verifier.concurrency":                   50,
-		"verifier.block_limit":                   1000,
-		"verifier.event_filter_limit":            1000,
-		"verifier.state_collect_limit":           1000,
-		"verifier.state_collect_timeout":         15 * time.Second,
-		"verifier.db_optimize_interval":          time.Hour,
-		"submitter.interval":                     15 * time.Second,
-		"submitter.concurrency":                  50,
-		"submitter.confirmations":                6,
-		"submitter.gas_multiplier":               1.1,
-		"submitter.batch_size":                   20,
-		"submitter.verifier_address":             "0x5200000000000000000000000000000000000014",
-		"submitter.multicall2_address":           "0x5200000000000000000000000000000000000022",
-		"submitter.use_multicall":                true,
-		"beacon.enable":                          true,
-		"beacon.endpoint":                        "https://script.google.com/macros/s/AKfycbzJpDKyn271jbm5otk_BxGkrS2b1YdMQerVq2-XxLdTOdhUPKCZICqvagvGgByxx_nq0Q/exec",
-		"beacon.interval":                        15 * time.Minute,
-		"database.long_query_time":               200 * time.Millisecond,
-		"database.min_examined_row_limit":        10000,
+
+		"p2p.no_announce": []string{
+			"/ip4/127.0.0.1/ipcidr/8",
+			"/ip4/10.0.0.0/ipcidr/8",
+			"/ip4/172.16.0.0/ipcidr/12",
+			"/ip4/192.168.0.0/ipcidr/16",
+		},
+		"p2p.connection_filter": []string{
+			"/ip4/127.0.0.1/ipcidr/8",
+			"/ip4/10.0.0.0/ipcidr/8",
+			"/ip4/172.16.0.0/ipcidr/12",
+			"/ip4/192.168.0.0/ipcidr/16",
+		},
+		"p2p.transports.tcp":               true,
+		"p2p.transports.quic":              true,
+		"p2p.nat.upnp":                     true,
+		"p2p.nat.autonat":                  true,
+		"p2p.nat.holepunch":                true,
+		"p2p.relay_client.enable":          true,
+		"p2p.publish_interval":             5 * time.Minute,
+		"p2p.stream_timeout":               10 * time.Second,
+		"p2p.outbound_limits.concurrency":  10,
+		"p2p.outbound_limits.throttling":   500,
+		"p2p.inbound_limits.concurrency":   10,
+		"p2p.inbound_limits.throttling":    500,
+		"p2p.inbound_limits.max_send_time": 30 * time.Second,
+
+		"ipc.sockname": "oasvlfy",
+
+		"verifier.interval":              15 * time.Second,
+		"verifier.concurrency":           50,
+		"verifier.block_limit":           1000,
+		"verifier.event_filter_limit":    1000,
+		"verifier.state_collect_limit":   1000,
+		"verifier.state_collect_timeout": 15 * time.Second,
+		"verifier.db_optimize_interval":  time.Hour,
+
+		"submitter.interval":           15 * time.Second,
+		"submitter.concurrency":        50,
+		"submitter.confirmations":      6,
+		"submitter.gas_multiplier":     1.1,
+		"submitter.batch_size":         20,
+		"submitter.max_gas":            5_000_000,
+		"submitter.verifier_address":   "0x5200000000000000000000000000000000000014",
+		"submitter.use_multicall":      true,
+		"submitter.multicall2_address": "0x5200000000000000000000000000000000000022",
+
+		"beacon.enable":   true,
+		"beacon.endpoint": "https://script.google.com/macros/s/AKfycbzJpDKyn271jbm5otk_BxGkrS2b1YdMQerVq2-XxLdTOdhUPKCZICqvagvGgByxx_nq0Q/exec",
+		"beacon.interval": 15 * time.Minute,
+
+		"database.long_query_time":        200 * time.Millisecond,
+		"database.min_examined_row_limit": 10000,
+
+		"metrics.type":     "prometheus",
+		"metrics.prefix":   "oasvlfy",
+		"metrics.listen":   "127.0.0.1:9200",
+		"metrics.endpoint": "/metrics",
+
+		"debug.pprof.listen":              "127.0.0.1:6060",
+		"debug.pprof.basic_auth.username": "username",
+		"debug.pprof.basic_auth.password": "password",
+		"debug.pprof.block_profile_rate":  0,
+		"debug.pprof.mem_profile_rate":    524288,
 	}
 )
 
@@ -109,7 +151,7 @@ type Config struct {
 	P2P P2P `json:"p2p"`
 
 	// IPC configuration.
-	IPC ipc `json:"ipc"`
+	IPC IPC `json:"ipc"`
 
 	// Verifier configuration.
 	Verifier Verifier `json:"verifier" mapstructure:"verifier"`
@@ -122,6 +164,12 @@ type Config struct {
 
 	// Database configuration.
 	Database Database `json:"database" mapstructure:"database"`
+
+	// Metrics configuration
+	Metrics Metrics `json:"metrics"`
+
+	// Debug configuration.
+	Debug Debug `json:"debug" mapstructure:"debug"`
 }
 
 func (c *Config) DatabasePath() string {
@@ -175,8 +223,70 @@ type verseLayer struct {
 }
 
 type P2P struct {
-	// Address and port to listen.
-	Listen string `json:"listen" validate:"hostname_port"`
+	// libp2p multi-addresses to listen.
+	Listens []string `json:"listens" mapstructure:"listens"`
+
+	// Additional multi-addresses to advertise.
+	AppendAnnounce []string `json:"append_announce" mapstructure:"append_announce"`
+
+	// Multi-addresses not advertised.
+	NoAnnounce []string `json:"no_announce" mapstructure:"no_announce"`
+
+	// Multi-addresses that filter dial or receive connections.
+	ConnectionFilter []string `json:"connection_filter" mapstructure:"connection_filter"`
+
+	// Enabled transport protocols.
+	Transports struct {
+		TCP  bool `json:"tcp"`
+		QUIC bool `json:"quic"`
+	} `json:"transports"`
+
+	// Deprecated: Address and port to listen.
+	Listen string `json:"listen" validate:"omitempty,hostname_port"`
+
+	// Initial node list.
+	Bootnodes []string `json:"bootnodes"`
+
+	// Enabled NAT Travasal features.
+	NAT struct {
+		UPnP      bool `json:"upnp" mapstructure:"upnp"`
+		AutoNAT   bool `json:"autonat" mapstructure:"autonat"`
+		HolePunch bool `json:"holepunch" mapstructure:"holepunch"`
+	} `json:"nat"`
+
+	// Enable Circuit Relay(v2) service.
+	// Note: Public connectivity is required.
+	RelayService struct {
+		Enable bool `json:"enable"`
+
+		// DurationLimit is the limit of data relayed (on each direction) before resetting the connection.
+		DurationLimit *time.Duration `json:"duration_limit,omitempty" mapstructure:"duration_limit"`
+		// DataLimit is the time limit before resetting a relayed connection.
+		DataLimit *int64 `json:"data_limit,omitempty" mapstructure:"data_limit"`
+
+		// ReservationTTL is the duration of a new (or refreshed reservation).
+		ReservationTTL *time.Duration `json:"reservation_ttl,omitempty" mapstructure:"reservation_ttl"`
+
+		// MaxReservations is the maximum number of active relay slots.
+		MaxReservations *int `json:"max_reservations,omitempty" mapstructure:"max_reservations"`
+		// MaxCircuits is the maximum number of open relay connections for each peer; defaults to 16.
+		MaxCircuits *int `json:"max_circuits,omitempty" mapstructure:"max_circuits"`
+		// BufferSize is the size of the relayed connection buffers.
+		BufferSize *int `json:"buffer_size,omitempty" mapstructure:"buffer_size"`
+
+		// MaxReservationsPerPeer is the maximum number of reservations originating from the same peer.
+		MaxReservationsPerPeer *int `json:"max_reservations_per_peer,omitempty" mapstructure:"max_reservations_per_peer"`
+		// MaxReservationsPerIP is the maximum number of reservations originating from the same IP address.
+		MaxReservationsPerIP *int `json:"max_reservations_per_ip,omitempty" mapstructure:"max_reservations_per_ip"`
+		// MaxReservationsPerASN is the maximum number of reservations origination from the same ASN.
+		MaxReservationsPerASN *int `json:"max_reservations_per_asn,omitempty" mapstructure:"max_reservations_per_asn"`
+	} `json:"relay_service" mapstructure:"relay_service"`
+
+	// Enable Circuit Relay(v2) client.
+	RelayClient struct {
+		Enable     bool     `json:"enable"`
+		RelayNodes []string `json:"relay_nodes" mapstructure:"relay_nodes"`
+	} `json:"relay_client" mapstructure:"relay_client"`
 
 	// Interval to publish own signature status.
 	PublishInterval time.Duration `json:"publish_interval" mapstructure:"publish_interval"`
@@ -184,13 +294,29 @@ type P2P struct {
 	// Timeout for P2P stream communication.
 	StreamTimeout time.Duration `json:"stream_timeout" mapstructure:"stream_timeout"`
 
-	// Initial node list.
-	Bootnodes []string `json:"bootnodes"`
+	OutboundLimits struct {
+		// Maximum number of concurrent signature requests from oneself to peers.
+		Concurrency int `json:"concurrency"`
+
+		// The number of signatures that can be sent to peers per second.
+		Throttling int `json:"throttling"`
+	} `json:"outbound_limits" mapstructure:"outbound_limits"`
+
+	InboundLimits struct {
+		// Maximum number of concurrent signature requests from peers to oneself.
+		Concurrency int `json:"concurrency"`
+
+		// The number of signatures that can be sent to peers per second.
+		Throttling int `json:"throttling"`
+
+		// Maximum time to send signatures to a peer.
+		MaxSendTime time.Duration `json:"max_send_time" mapstructure:"max_send_time"`
+	} `json:"inbound_limits" mapstructure:"inbound_limits"`
 }
 
-type ipc struct {
-	// Whether to enable worker.
-	Enable bool `json:"enable"`
+type IPC struct {
+	// Socket file name, In UNIX-based OS, it is created as /tmp/{sockname}.sock.
+	Sockname string `json:"sockname"`
 }
 
 type Verifier struct {
@@ -245,8 +371,8 @@ type Submitter struct {
 	VerifierAddress string `json:"verifier_address" mapstructure:"verifier_address"`
 
 	// Address of the Multicall2 contract.
-	Multicall2Address string `json:"multicall2_address" mapstructure:"multicall2_address"`
 	UseMulticall      bool   `json:"use_multicall" mapstructure:"use_multicall"`
+	Multicall2Address string `json:"multicall2_address" mapstructure:"multicall2_address"`
 
 	Targets []struct {
 		// Chain ID of the Verse-Layer.
@@ -279,4 +405,44 @@ type Database struct {
 	// Slow query log configurations.
 	LongQueryTime       time.Duration `json:"long_query_time"        mapstructure:"long_query_time"`
 	MinExaminedRowLimit int           `json:"min_examined_row_limit" mapstructure:"min_examined_row_limit"`
+}
+
+type Metrics struct {
+	// Whether to pprof server.
+	Enable bool `json:"enable"`
+
+	// Address and port to listen.
+	Listen string `json:"listen" validate:"hostname_port"`
+
+	// The URL used to retrieve metrics.
+	Endpoint string `json:"endpoint"`
+
+	// The type of metrics collector.
+	Type string `json:"type"`
+
+	// Metric name prefix.
+	Prefix string `json:"prefix"`
+}
+
+type Debug struct {
+	Pprof Pprof `json:"pprof" validate:"dive"`
+}
+
+type Pprof struct {
+	// Whether to pprof server.
+	Enable bool `json:"enable"`
+
+	// Address and port to listen.
+	Listen string `json:"listen" validate:"hostname_port"`
+
+	BasicAuth struct {
+		Username string `json:"username"`
+		Password string `json:"password"`
+	} `json:"basic_auth" mapstructure:"basic_auth"`
+
+	// Turn on block profiling with the given rate.
+	BlockProfileRate int `json:"block_profile_rate" mapstructure:"block_profile_rate"`
+
+	// Turn on memory profiling with the given rate.
+	MemProfileRate int `json:"mem_profile_rate" mapstructure:"mem_profile_rate"`
 }

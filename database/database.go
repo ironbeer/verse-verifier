@@ -21,11 +21,12 @@ var (
 		&OpstackL2OutputOracle{},
 		&OpstackProposal{},
 		&OpstackSignature{},
+		&Misc{},
 	}
 )
 
 type Database struct {
-	db *gorm.DB
+	rawdb *gorm.DB
 
 	Signer   *SignerDatabase
 	Block    *BlockDatabase
@@ -61,20 +62,21 @@ func NewDatabase(cfg *config.Database) (*Database, error) {
 }
 
 func (db *Database) Transaction(fn func(*Database) error) error {
-	return db.db.Transaction(func(tx *gorm.DB) error {
+	return db.rawdb.Transaction(func(tx *gorm.DB) error {
 		return fn(newDB(tx))
 	})
 }
 
-func newDB(db *gorm.DB) *Database {
-	signer := &SignerDatabase{db: db}
-	return &Database{
-		db:       db,
-		Signer:   signer,
-		Block:    &BlockDatabase{db: db},
-		Optimism: &OptimismDatabase{db: db, SignerDatabase: signer},
-		OPStack:  &OPStackDatabase{db: db, SignerDatabase: signer},
+func newDB(rawdb *gorm.DB) *Database {
+	var db Database
+	db = Database{
+		rawdb:    rawdb,
+		Signer:   &SignerDatabase{rawdb: rawdb, db: &db},
+		Block:    &BlockDatabase{rawdb: rawdb, db: &db},
+		Optimism: &OptimismDatabase{rawdb: rawdb, db: &db},
+		OPStack:  &OPStackDatabase{rawdb: rawdb, db: &db},
 	}
+	return &db
 }
 
 func errconv(err error) error {

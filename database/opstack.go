@@ -11,14 +11,29 @@ import (
 )
 
 type OPStackDatabase struct {
-	*SignerDatabase
+	rawdb *gorm.DB
+	db    *Database
+}
 
-	db *gorm.DB
+func (db *OPStackDatabase) FindOrCreateL2OO(l2oo_ common.Address) (row *OpstackL2OutputOracle, err error) {
+	err = db.rawdb.Transaction(func(txdb *gorm.DB) error {
+		tx := txdb.Where("address = ?", l2oo_).First(&row)
+		if errors.Is(tx.Error, gorm.ErrRecordNotFound) {
+			row.Address = l2oo_
+			row.NextVerifyIndex = 0
+			return txdb.Create(&row).Error
+		}
+		return tx.Error
+	})
+	if err != nil {
+		return nil, err
+	}
+	return row, nil
 }
 
 func (db *OPStackDatabase) FindL2OOs() ([]*OpstackL2OutputOracle, error) {
 	var rows []*OpstackL2OutputOracle
-	tx := db.db.Find(&rows)
+	tx := db.rawdb.Find(&rows)
 
 	if tx.Error != nil {
 		return nil, tx.Error
@@ -26,38 +41,19 @@ func (db *OPStackDatabase) FindL2OOs() ([]*OpstackL2OutputOracle, error) {
 	return rows, nil
 }
 
-func (db *OPStackDatabase) FindOrCreateL2OO(l2oo_ common.Address) (*OpstackL2OutputOracle, error) {
-	var row OpstackL2OutputOracle
-	tx := db.db.Where("address = ?", l2oo_).First(&row)
-
-	if errors.Is(tx.Error, gorm.ErrRecordNotFound) {
-		row.Address = l2oo_
-		row.NextVerifyIndex = 0
-
-		tx = db.db.Create(&row)
-		if tx.Error != nil {
-			return nil, tx.Error
-		}
-	} else if tx.Error != nil {
-		return nil, tx.Error
-	}
-
-	return &row, nil
-}
-
 func (db *OPStackDatabase) FindProposal(
 	l2oo_ common.Address,
 	l2OutputIndex uint64,
 ) (*OpstackProposal, error) {
-	sub, err := db.l2ooIdSub(l2oo_)
+	_l2oo, err := db.FindOrCreateL2OO(l2oo_)
 	if err != nil {
 		return nil, err
 	}
 
 	var row OpstackProposal
-	tx := db.db.
+	tx := db.rawdb.
 		Joins("OpstackL2OutputOracle").
-		Where("opstack_proposals.opstack_l2_output_oracle_id = (?)", sub).
+		Where("opstack_proposals.opstack_l2_output_oracle_id = ?", _l2oo.ID).
 		Where("opstack_proposals.l2_output_index = ?", l2OutputIndex).
 		First(&row)
 
@@ -74,7 +70,7 @@ func (db *OPStackDatabase) FindVerificationWaitingProposals(
 	nextVerifyIndex uint64,
 	limit int,
 ) ([]*OpstackProposal, error) {
-	signerSub, err := db.signerIdSub(signer)
+	_signer, err := db.db.Signer.FindOrCreateSigner(signer)
 	if err != nil {
 		return nil, err
 	}
@@ -88,16 +84,16 @@ func (db *OPStackDatabase) FindVerificationWaitingProposals(
 		nextVerifyIndex = l2oo_.NextVerifyIndex
 	}
 
-	sub := db.db.Model(&OpstackSignature{}).
+	sub := db.rawdb.Model(&OpstackSignature{}).
 		Select("l2_output_index").
-		Where("opstack_l2_output_oracle_id = ? AND signer_id = (?)", l2oo_.ID, signerSub).
+		Where("opstack_l2_output_oracle_id = ? AND signer_id = ?", l2oo_.ID, _signer.ID).
 		Where("l2_output_index >= ?", nextVerifyIndex)
 	if sub.Error != nil {
 		return nil, sub.Error
 	}
 
 	var rows []*OpstackProposal
-	tx := db.db.
+	tx := db.rawdb.
 		Joins("OpstackL2OutputOracle").
 		Where("opstack_l2_output_oracle_id = ? AND l2_output_index >= ?", l2oo_.ID, nextVerifyIndex).
 		Where("l2_output_index NOT IN (?)", sub).
@@ -118,7 +114,7 @@ func (db *OPStackDatabase) SaveNextVerifyIndex(l2ooAddr common.Address, nextVeri
 	}
 
 	l2oo_.NextVerifyIndex = nextVerifyIndex
-	return db.db.Save(l2oo_).Error
+	return db.rawdb.Save(l2oo_).Error
 }
 
 // Save new state batch appended event to database.
@@ -130,7 +126,7 @@ func (db *OPStackDatabase) SaveProposal(e *l2oo.OasysL2OutputOracleOutputPropose
 		L1Timestamp:   e.L1Timestamp.Uint64(),
 	}
 
-	err := db.db.Transaction(func(s *gorm.DB) error {
+	err := db.rawdb.Transaction(func(s *gorm.DB) error {
 		l2oo_, err := newDB(s).OPStack.FindOrCreateL2OO(e.Raw.Address)
 		if err != nil {
 			return err
@@ -157,7 +153,7 @@ func (db *OPStackDatabase) SaveSignature(
 	approved bool,
 	signature Signature,
 ) (*OpstackSignature, error) {
-	_signer, err := db.FindOrCreateSigner(signer)
+	_signer, err := db.db.Signer.FindOrCreateSigner(signer)
 	if err != nil {
 		return nil, err
 	}
@@ -188,7 +184,7 @@ func (db *OPStackDatabase) SaveSignature(
 	}
 
 	var created OpstackSignature
-	err = db.db.Transaction(func(s *gorm.DB) error {
+	err = db.rawdb.Transaction(func(s *gorm.DB) error {
 		// Delete the same batch index signature as it may be recreated for reasons such as chain reorganization.
 		if tx := s.Model(&OpstackSignature{}).
 			Where("signer_id = ? AND opstack_l2_output_oracle_id = ?", _signer.ID, l2oo_.ID).
@@ -228,24 +224,34 @@ func (db *OPStackDatabase) SaveSignature(
 }
 
 func (db *OPStackDatabase) FindLatestSignaturePerSigners() ([]*OpstackSignature, error) {
-	var maxIds []string
-	tx := db.db.Model(&OpstackSignature{}).
-		Select("MAX(id)").
-		Group("signer_id").
-		Find(&maxIds)
+	// search foolishly because group by is slow
+	var signers []uint64
+	tx := db.rawdb.Model(&Signer{}).
+		Select("id").
+		Find(&signers)
 	if tx.Error != nil {
 		return nil, tx.Error
 	}
 
 	var rows []*OpstackSignature
-	tx = db.db.
-		Joins("Signer").
-		Joins("OpstackL2OutputOracle").
-		Where("opstack_signatures.id IN (?)", maxIds).
-		Find(&rows)
+	for _, signer := range signers {
+		sub := db.rawdb.
+			Table("opstack_signatures").
+			Select("MAX(id)").
+			Where("signer_id = ?", signer)
 
-	if tx.Error != nil {
-		return nil, tx.Error
+		var row OpstackSignature
+		tx := db.rawdb.
+			Joins("Signer").
+			Joins("OpstackL2OutputOracle").
+			Where("opstack_signatures.id = (?)", sub).
+			First(&row)
+		if errors.Is(tx.Error, gorm.ErrRecordNotFound) {
+			continue
+		} else if tx.Error != nil {
+			return nil, tx.Error
+		}
+		rows = append(rows, &row)
 	}
 	return rows, nil
 }
@@ -254,16 +260,16 @@ func (db *OPStackDatabase) FindLatestSignaturesBySigner(
 	signer common.Address,
 	limit, offset int,
 ) ([]*OpstackSignature, error) {
-	sub, err := db.signerIdSub(signer)
+	_signer, err := db.db.Signer.FindOrCreateSigner(signer)
 	if err != nil {
 		return nil, err
 	}
 
 	var rows []*OpstackSignature
-	tx := db.db.
+	tx := db.rawdb.
 		Joins("Signer").
 		Joins("OpstackL2OutputOracle").
-		Where("opstack_signatures.signer_id = (?)", sub).
+		Where("opstack_signatures.signer_id = ?", _signer.ID).
 		Order("opstack_signatures.id DESC").
 		Limit(limit).
 		Offset(offset).
@@ -277,7 +283,7 @@ func (db *OPStackDatabase) FindLatestSignaturesBySigner(
 
 func (db *OPStackDatabase) FindSignatureByID(id string) (*OpstackSignature, error) {
 	var row OpstackSignature
-	tx := db.db.
+	tx := db.rawdb.
 		Joins("Signer").
 		Joins("OpstackL2OutputOracle").
 		Where("opstack_signatures.id = ?", id).
@@ -296,7 +302,7 @@ func (db *OPStackDatabase) FindSignatures(
 	l2OutputIndex *uint64,
 	limit, offset int,
 ) ([]*OpstackSignature, error) {
-	tx := db.db.
+	tx := db.rawdb.
 		Joins("Signer").
 		Joins("OpstackL2OutputOracle").
 		Order("opstack_signatures.id").
@@ -307,18 +313,18 @@ func (db *OPStackDatabase) FindSignatures(
 		tx = tx.Where("opstack_signatures.id >= ?", *idAfter)
 	}
 	if signer != nil {
-		if sub, err := db.signerIdSub(*signer); err != nil {
+		_signer, err := db.db.Signer.FindOrCreateSigner(*signer)
+		if err != nil {
 			return nil, err
-		} else {
-			tx = tx.Where("opstack_signatures.signer_id = (?)", sub)
 		}
+		tx = tx.Where("opstack_signatures.signer_id = ?", _signer.ID)
 	}
 	if l2oo_ != nil {
-		if sub, err := db.l2ooIdSub(*l2oo_); err != nil {
+		_l2oo, err := db.FindOrCreateL2OO(*l2oo_)
+		if err != nil {
 			return nil, err
-		} else {
-			tx = tx.Where("opstack_signatures.opstack_l2_output_oracle_id = (?)", sub)
 		}
+		tx = tx.Where("opstack_signatures.opstack_l2_output_oracle_id = ?", _l2oo.ID)
 	}
 	if l2OutputIndex != nil {
 		tx = tx.Where("opstack_signatures.l2_output_index = ?", *l2OutputIndex)
@@ -336,7 +342,7 @@ func (db *OPStackDatabase) FindSignatures(
 // Delete states after the specified l2OutputIndex.
 func (db *OPStackDatabase) DeleteProposals(l2oo_ common.Address, l2OutputIndex uint64) (int64, error) {
 	var affected int64
-	err := db.db.Transaction(func(s *gorm.DB) error {
+	err := db.rawdb.Transaction(func(s *gorm.DB) error {
 		var ids []uint64
 		tx := s.
 			Model(&OpstackProposal{}).
@@ -369,7 +375,7 @@ func (db *OPStackDatabase) DeleteSignatures(
 	l2OutputIndex uint64,
 ) (int64, error) {
 	var affected int64
-	err := db.db.Transaction(func(s *gorm.DB) error {
+	err := db.rawdb.Transaction(func(s *gorm.DB) error {
 		var ids []string
 		tx := s.
 			Model(&OpstackSignature{}).
@@ -395,14 +401,4 @@ func (db *OPStackDatabase) DeleteSignatures(
 	}
 
 	return affected, nil
-}
-
-func (db *OPStackDatabase) l2ooIdSub(l2oo common.Address) (*gorm.DB, error) {
-	sub := db.db.Model(&OpstackL2OutputOracle{}).
-		Select("id").
-		Where("address = ?", l2oo)
-	if sub.Error != nil {
-		return nil, sub.Error
-	}
-	return sub, nil
 }

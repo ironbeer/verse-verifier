@@ -1,11 +1,8 @@
 package database
 
 import (
-	"errors"
-
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/log"
-	"gorm.io/gorm"
 )
 
 func (db *OptimismDatabase) RepairPreviousID(signer common.Address) {
@@ -16,7 +13,7 @@ func (db *OptimismDatabase) RepairPreviousID(signer common.Address) {
 // Repair signatures with previous_id overtaking id.
 func (db *OptimismDatabase) repairOvertakingSignatures(signer common.Address) {
 	var rows []*OptimismSignature
-	tx := db.db.
+	tx := db.rawdb.
 		Joins("Signer").
 		Joins("OptimismScc").
 		Where("Signer.address = ?", signer).
@@ -34,7 +31,7 @@ func (db *OptimismDatabase) repairOvertakingSignatures(signer common.Address) {
 
 func (db *OptimismDatabase) repairMissingPrevID(signer common.Address) {
 	var rows []*OptimismSignature
-	tx := db.db.
+	tx := db.rawdb.
 		Joins("Signer").
 		Joins("OptimismScc").
 		Joins("LEFT JOIN optimism_signatures AS t2 ON optimism_signatures.previous_id = t2.id").
@@ -59,24 +56,26 @@ func (db *OptimismDatabase) repairPrevID(row *OptimismSignature, reason string) 
 		"id", row.ID, "old-previous-id", row.PreviousID,
 	}
 
-	var prevRow *OptimismSignature
-	tx := db.db.
+	var prevRow []*OptimismSignature
+	tx := db.rawdb.
 		Where("optimism_signatures.signer_id = ?", row.SignerID).
 		Where("optimism_signatures.id < ?", row.ID).
 		Order("optimism_signatures.id DESC").
 		Limit(1).
-		First(&prevRow)
+		Find(&prevRow)
 
 	if tx.Error == nil {
-		row.PreviousID = prevRow.ID
-	} else if errors.Is(tx.Error, gorm.ErrRecordNotFound) {
-		row.PreviousID = ""
+		if len(prevRow) > 0 {
+			row.PreviousID = prevRow[0].ID
+		} else {
+			row.PreviousID = ""
+		}
 	} else {
 		log.Error("Previous signature does not exist", append(logCtx, "err", tx.Error)...)
 		return
 	}
 
-	if tx := db.db.Save(row); tx.Error != nil {
+	if tx := db.rawdb.Save(row); tx.Error != nil {
 		log.Error("Failed to save new previous id", append(logCtx, "err", tx.Error)...)
 		return
 	}

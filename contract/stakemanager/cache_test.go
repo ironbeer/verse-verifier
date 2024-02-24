@@ -7,14 +7,13 @@ import (
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/oasysgames/oasys-optimism-verifier/testhelper"
-	"github.com/oasysgames/oasys-optimism-verifier/testhelper/backend"
 	"github.com/stretchr/testify/suite"
 )
 
 type CacheTestSuite struct {
 	testhelper.Suite
 
-	sm *backend.StakeManagerMock
+	sm *testhelper.StakeManagerMock
 	vs *Cache
 }
 
@@ -23,7 +22,7 @@ func TestNewCache(t *testing.T) {
 }
 
 func (s *CacheTestSuite) SetupTest() {
-	s.sm = &backend.StakeManagerMock{}
+	s.sm = &testhelper.StakeManagerMock{}
 	s.vs = NewCache(s.sm)
 
 	for i := range s.Range(0, 1000) {
@@ -37,6 +36,7 @@ func (s *CacheTestSuite) SetupTest() {
 
 func (s *CacheTestSuite) TestRefresh() {
 	s.Equal(common.Big0, s.vs.TotalStake())
+	s.Len(s.vs.SignerStakes(), 0)
 	for _, signer := range s.sm.Operators {
 		s.Equal(common.Big0, s.vs.StakeBySigner(signer))
 	}
@@ -44,7 +44,10 @@ func (s *CacheTestSuite) TestRefresh() {
 	s.Nil(s.vs.Refresh(context.Background()))
 
 	s.Equal(big.NewInt(499500), s.vs.TotalStake())
+	stakes := s.vs.SignerStakes()
+	s.Len(stakes, len(s.sm.Operators))
 	for i, signer := range s.sm.Operators {
 		s.Equal(s.sm.Stakes[i], s.vs.StakeBySigner(signer))
+		s.Equal(s.sm.Stakes[i], stakes[signer])
 	}
 }

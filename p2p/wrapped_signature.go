@@ -5,6 +5,7 @@ import (
 	"github.com/oasysgames/oasys-optimism-verifier/p2p/pb"
 )
 
+// Wrapped `database.OptimismSignature`.
 type iWrappedSignature interface {
 	getID() string
 	getPreviousID() string
@@ -27,6 +28,7 @@ func (s *wrappedOptimismSignature) findCommonSignatureResponse() *pb.Stream {
 		found = s.protoSig()
 	}
 	return &pb.Stream{Body: &pb.Stream_FindCommonOptimismSignature{
+		// If not found, `nil` must be returned to the peer
 		FindCommonOptimismSignature: &pb.FindCommonOptimismSignature{Found: found},
 	}}
 }
@@ -47,6 +49,7 @@ func (s *wrappedOptimismSignature) protoSig() *pb.OptimismSignature {
 	}
 }
 
+// Wrapped `database.OpstackSignature`.
 type wrappedOpstackSignature database.OpstackSignature
 
 func (s *wrappedOpstackSignature) getID() string {
@@ -63,6 +66,7 @@ func (s *wrappedOpstackSignature) findCommonSignatureResponse() *pb.Stream {
 		found = s.protoSig()
 	}
 	return &pb.Stream{Body: &pb.Stream_FindCommonOpstackSignature{
+		// If not found, `nil` must be returned to the peer
 		FindCommonOpstackSignature: &pb.FindCommonOpstackSignature{Found: found},
 	}}
 }
@@ -86,7 +90,7 @@ type wrappedSignatures interface {
 	len() int
 	get(index int) iWrappedSignature
 	signatureExchangeResponse() *pb.Stream
-	findCommonSignatureRequest() (msg *pb.Stream, from, to string, err error)
+	findCommonSignatureRequest() (msg *pb.Stream, count int, fromID, toID string, err error)
 }
 
 type wrappedOptimismSignatures []*database.OptimismSignature
@@ -115,7 +119,7 @@ func (ss wrappedOptimismSignatures) signatureExchangeResponse() *pb.Stream {
 	}}
 }
 
-func (ss wrappedOptimismSignatures) findCommonSignatureRequest() (msg *pb.Stream, from, to string, err error) {
+func (ss wrappedOptimismSignatures) findCommonSignatureRequest() (msg *pb.Stream, count int, fromID, toID string, err error) {
 	locals := make([]*pb.FindCommonOptimismSignature_Local, len(ss))
 	for i, sig := range ss {
 		locals[i] = &pb.FindCommonOptimismSignature_Local{
@@ -126,7 +130,7 @@ func (ss wrappedOptimismSignatures) findCommonSignatureRequest() (msg *pb.Stream
 
 	return &pb.Stream{Body: &pb.Stream_FindCommonOptimismSignature{
 		FindCommonOptimismSignature: &pb.FindCommonOptimismSignature{Locals: locals},
-	}}, ss[0].ID, ss[len(ss)-1].ID, nil
+	}}, ss.len(), ss[0].ID, ss[len(ss)-1].ID, nil
 }
 
 type wrappedOpstackSignatures []*database.OpstackSignature
@@ -155,7 +159,7 @@ func (ss wrappedOpstackSignatures) signatureExchangeResponse() *pb.Stream {
 	}}
 }
 
-func (ss wrappedOpstackSignatures) findCommonSignatureRequest() (msg *pb.Stream, from, to string, err error) {
+func (ss wrappedOpstackSignatures) findCommonSignatureRequest() (msg *pb.Stream, count int, fromID, toID string, err error) {
 	locals := make([]*pb.FindCommonOpstackSignature_Local, len(ss))
 	for i, sig := range ss {
 		locals[i] = &pb.FindCommonOpstackSignature_Local{
@@ -166,5 +170,5 @@ func (ss wrappedOpstackSignatures) findCommonSignatureRequest() (msg *pb.Stream,
 
 	return &pb.Stream{Body: &pb.Stream_FindCommonOpstackSignature{
 		FindCommonOpstackSignature: &pb.FindCommonOpstackSignature{Locals: locals},
-	}}, ss[0].ID, ss[len(ss)-1].ID, nil
+	}}, ss.len(), ss[0].ID, ss[len(ss)-1].ID, nil
 }

@@ -93,7 +93,7 @@ func (s *SubmitterTestSuite) TestSubmitSCC() {
 	s.Hub.Commit()
 
 	// submitter do the work.
-	s.submitter.stakeCache.Refresh(ctx)
+	s.submitter.stakemanager.Refresh(ctx)
 	task, _ := NewTask(s.Hub, s.SCCAddr, s.SCC, s.SCCV, s.Mcall2)
 	go s.submitter.work(ctx, task)
 	time.Sleep(time.Millisecond * 25)
@@ -168,7 +168,7 @@ func (s *SubmitterTestSuite) TestSubmitL2OO() {
 	s.Hub.Commit()
 
 	// submitter do the work.
-	s.submitter.stakeCache.Refresh(ctx)
+	s.submitter.stakemanager.Refresh(ctx)
 	task, _ := NewTask(s.Hub, s.L2OOAddr, s.L2OO, s.SCCV, s.Mcall2)
 	go s.submitter.work(ctx, task)
 	time.Sleep(time.Millisecond * 25)

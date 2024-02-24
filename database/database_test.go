@@ -24,7 +24,7 @@ func (s *DatabaseTestSuite) SetupTest() {
 		panic(err)
 	}
 	s.db = db
-	s.rawdb = db.db
+	s.rawdb = db.rawdb
 }
 
 func (s *DatabaseTestSuite) createSigner() *Signer {
@@ -57,6 +57,9 @@ func (s *DatabaseTestSuite) createSignature(
 	scc *OptimismScc,
 	index int,
 ) *OptimismSignature {
+	// avoiding duplication of ULID
+	time.Sleep(time.Millisecond)
+
 	sig := &OptimismSignature{
 		ID:          util.ULID(nil).String(),
 		PreviousID:  util.ULID(nil).String(),

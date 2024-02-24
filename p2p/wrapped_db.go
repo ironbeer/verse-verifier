@@ -27,7 +27,7 @@ type iWrappedDB interface {
 	getSignatureExchangeRequest(signer common.Address, idAfter string) *pb.Stream
 	handleFindCommonSignatureResponse(res *pb.Stream) (sig pb.ISignature, found bool, err error)
 	saveSignature(pbMsg interface{}) error
-	verifySignature(hubLayerChainID *big.Int, pbMsg interface{}) (bool, error)
+	verifySignature(hubLayerChainID *big.Int, pbMsg interface{}) error
 }
 
 type wrappedOptimismDB struct {
@@ -102,19 +102,28 @@ func (w *wrappedOptimismDB) saveSignature(pbMsg interface{}) error {
 	return err
 }
 
-func (w *wrappedOptimismDB) verifySignature(hubLayerChainID *big.Int, pbMsg interface{}) (bool, error) {
+func (w *wrappedOptimismDB) verifySignature(hubLayerChainID *big.Int, pbMsg interface{}) error {
 	t, ok := pbMsg.(*pb.OptimismSignature)
 	if !ok {
-		return false, errors.New("not an optimism signature")
+		return errors.New("not an optimism signature")
 	}
 
-	msg := verifier.NewSccMessage(
-		hubLayerChainID,
-		common.BytesToAddress(t.Scc),
-		new(big.Int).SetUint64(t.BatchIndex),
-		common.BytesToHash(t.BatchRoot),
-		t.Approved)
-	return msg.VerifySigner(t.Signature, common.BytesToAddress(t.Signer))
+	signer := common.BytesToAddress(t.Signer)
+	scc := common.BytesToAddress(t.Scc)
+	batchIndex := new(big.Int).SetUint64(t.BatchIndex)
+	batchRoot := common.BytesToHash(t.BatchRoot)
+
+	msg := verifier.NewSccMessage(hubLayerChainID, scc, batchIndex, batchRoot, t.Approved)
+	err := msg.VerifySigner(t.Signature, signer)
+
+	// possibly an old signature with an approved bug
+	if _, ok := err.(*verifier.SignerMismatchError); ok {
+		msg = verifier.NewSCCMessageWithApprovedBug(
+			hubLayerChainID, scc, batchIndex, batchRoot, t.Approved)
+		err = msg.VerifySigner(t.Signature, signer)
+	}
+
+	return err
 }
 
 // Wrapped `database.OPStackDatabase`.
@@ -189,10 +198,10 @@ func (w *wrappedOpstackDB) saveSignature(pbMsg interface{}) error {
 	return err
 }
 
-func (w *wrappedOpstackDB) verifySignature(hubLayerChainID *big.Int, pbMsg interface{}) (bool, error) {
+func (w *wrappedOpstackDB) verifySignature(hubLayerChainID *big.Int, pbMsg interface{}) error {
 	t, ok := pbMsg.(*pb.OpstackSignature)
 	if !ok {
-		return false, errors.New("not an opstack signature")
+		return errors.New("not an opstack signature")
 	}
 
 	msg := verifier.NewL2ooMessage(

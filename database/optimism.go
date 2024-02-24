@@ -11,33 +11,29 @@ import (
 )
 
 type OptimismDatabase struct {
-	*SignerDatabase
-
-	db *gorm.DB
+	rawdb *gorm.DB
+	db    *Database
 }
 
-func (db *OptimismDatabase) FindOrCreateSCC(scc common.Address) (*OptimismScc, error) {
-	var row OptimismScc
-	tx := db.db.Where("address = ?", scc).First(&row)
-
-	if errors.Is(tx.Error, gorm.ErrRecordNotFound) {
-		row.Address = scc
-		row.NextIndex = 0
-
-		tx = db.db.Create(&row)
-		if tx.Error != nil {
-			return nil, tx.Error
+func (db *OptimismDatabase) FindOrCreateSCC(scc common.Address) (row *OptimismScc, err error) {
+	err = db.rawdb.Transaction(func(txdb *gorm.DB) error {
+		tx := txdb.Where("address = ?", scc).First(&row)
+		if errors.Is(tx.Error, gorm.ErrRecordNotFound) {
+			row.Address = scc
+			row.NextIndex = 0
+			return txdb.Create(&row).Error
 		}
-	} else if tx.Error != nil {
-		return nil, tx.Error
+		return tx.Error
+	})
+	if err != nil {
+		return nil, err
 	}
-
-	return &row, nil
+	return row, nil
 }
 
 func (db *OptimismDatabase) FindSCCs() ([]*OptimismScc, error) {
 	var rows []*OptimismScc
-	tx := db.db.Find(&rows)
+	tx := db.rawdb.Find(&rows)
 
 	if tx.Error != nil {
 		return nil, tx.Error
@@ -49,15 +45,15 @@ func (db *OptimismDatabase) FindState(
 	scc common.Address,
 	batchIndex uint64,
 ) (*OptimismState, error) {
-	sub, err := db.sccIdSub(scc)
+	_scc, err := db.FindOrCreateSCC(scc)
 	if err != nil {
 		return nil, err
 	}
 
 	var row OptimismState
-	tx := db.db.
+	tx := db.rawdb.
 		Joins("OptimismScc").
-		Where("optimism_states.optimism_scc_id = (?)", sub).
+		Where("optimism_states.optimism_scc_id = ?", _scc.ID).
 		Where("optimism_states.batch_index = ?", batchIndex).
 		First(&row)
 
@@ -74,7 +70,7 @@ func (db *OptimismDatabase) FindVerificationWaitingStates(
 	nextIndex uint64,
 	limit int,
 ) ([]*OptimismState, error) {
-	signerSub, err := db.signerIdSub(signer)
+	_signer, err := db.db.Signer.FindOrCreateSigner(signer)
 	if err != nil {
 		return nil, err
 	}
@@ -88,16 +84,16 @@ func (db *OptimismDatabase) FindVerificationWaitingStates(
 		nextIndex = _scc.NextIndex
 	}
 
-	sub := db.db.Model(&OptimismSignature{}).
+	sub := db.rawdb.Model(&OptimismSignature{}).
 		Select("batch_index").
-		Where("optimism_scc_id = ? AND signer_id = (?)", _scc.ID, signerSub).
+		Where("optimism_scc_id = ? AND signer_id = ?", _scc.ID, _signer.ID).
 		Where("batch_index >= ?", nextIndex)
 	if sub.Error != nil {
 		return nil, sub.Error
 	}
 
 	var rows []*OptimismState
-	tx := db.db.
+	tx := db.rawdb.
 		Joins("OptimismScc").
 		Where("optimism_scc_id = ? AND batch_index >= ?", _scc.ID, nextIndex).
 		Where("batch_index NOT IN (?)", sub).
@@ -118,7 +114,7 @@ func (db *OptimismDatabase) SaveNextIndex(scc common.Address, nextIndex uint64) 
 	}
 
 	scc_.NextIndex = nextIndex
-	return db.db.Save(scc_).Error
+	return db.rawdb.Save(scc_).Error
 }
 
 // Save new state batch appended event to database.
@@ -131,7 +127,7 @@ func (db *OptimismDatabase) SaveState(e *scc.SccStateBatchAppended) (*OptimismSt
 		ExtraData:         e.ExtraData,
 	}
 
-	err := db.db.Transaction(func(s *gorm.DB) error {
+	err := db.rawdb.Transaction(func(s *gorm.DB) error {
 		scc, err := newDB(s).Optimism.FindOrCreateSCC(e.Raw.Address)
 		if err != nil {
 			return err
@@ -159,7 +155,7 @@ func (db *OptimismDatabase) SaveSignature(
 	approved bool,
 	signature Signature,
 ) (*OptimismSignature, error) {
-	_signer, err := db.FindOrCreateSigner(signer)
+	_signer, err := db.db.Signer.FindOrCreateSigner(signer)
 	if err != nil {
 		return nil, err
 	}
@@ -191,7 +187,7 @@ func (db *OptimismDatabase) SaveSignature(
 	}
 
 	var created OptimismSignature
-	err = db.db.Transaction(func(s *gorm.DB) error {
+	err = db.rawdb.Transaction(func(s *gorm.DB) error {
 		// Delete the same batch index signature as it may be recreated for reasons such as chain reorganization.
 		if tx := s.Model(&OptimismSignature{}).
 			Where("signer_id = ? AND optimism_scc_id = ?", _signer.ID, _scc.ID).
@@ -231,24 +227,34 @@ func (db *OptimismDatabase) SaveSignature(
 }
 
 func (db *OptimismDatabase) FindLatestSignaturePerSigners() ([]*OptimismSignature, error) {
-	var maxIds []string
-	tx := db.db.Model(&OptimismSignature{}).
-		Select("MAX(id)").
-		Group("signer_id").
-		Find(&maxIds)
+	// search foolishly because group by is slow
+	var signers []uint64
+	tx := db.rawdb.Model(&Signer{}).
+		Select("id").
+		Find(&signers)
 	if tx.Error != nil {
 		return nil, tx.Error
 	}
 
 	var rows []*OptimismSignature
-	tx = db.db.
-		Joins("Signer").
-		Joins("OptimismScc").
-		Where("optimism_signatures.id IN (?)", maxIds).
-		Find(&rows)
+	for _, signer := range signers {
+		sub := db.rawdb.
+			Table("optimism_signatures").
+			Select("MAX(id)").
+			Where("signer_id = ?", signer)
 
-	if tx.Error != nil {
-		return nil, tx.Error
+		var row OptimismSignature
+		tx := db.rawdb.
+			Joins("Signer").
+			Joins("OptimismScc").
+			Where("optimism_signatures.id = (?)", sub).
+			First(&row)
+		if errors.Is(tx.Error, gorm.ErrRecordNotFound) {
+			continue
+		} else if tx.Error != nil {
+			return nil, tx.Error
+		}
+		rows = append(rows, &row)
 	}
 	return rows, nil
 }
@@ -257,16 +263,16 @@ func (db *OptimismDatabase) FindLatestSignaturesBySigner(
 	signer common.Address,
 	limit, offset int,
 ) ([]*OptimismSignature, error) {
-	sub, err := db.signerIdSub(signer)
+	_signer, err := db.db.Signer.FindOrCreateSigner(signer)
 	if err != nil {
 		return nil, err
 	}
 
 	var rows []*OptimismSignature
-	tx := db.db.
+	tx := db.rawdb.
 		Joins("Signer").
 		Joins("OptimismScc").
-		Where("optimism_signatures.signer_id = (?)", sub).
+		Where("optimism_signatures.signer_id = ?", _signer.ID).
 		Order("optimism_signatures.id DESC").
 		Limit(limit).
 		Offset(offset).
@@ -280,7 +286,7 @@ func (db *OptimismDatabase) FindLatestSignaturesBySigner(
 
 func (db *OptimismDatabase) FindSignatureByID(id string) (*OptimismSignature, error) {
 	var row OptimismSignature
-	tx := db.db.
+	tx := db.rawdb.
 		Joins("Signer").
 		Joins("OptimismScc").
 		Where("optimism_signatures.id = ?", id).
@@ -299,7 +305,7 @@ func (db *OptimismDatabase) FindSignatures(
 	index *uint64,
 	limit, offset int,
 ) ([]*OptimismSignature, error) {
-	tx := db.db.
+	tx := db.rawdb.
 		Joins("Signer").
 		Joins("OptimismScc").
 		Order("optimism_signatures.id").
@@ -310,18 +316,18 @@ func (db *OptimismDatabase) FindSignatures(
 		tx = tx.Where("optimism_signatures.id >= ?", *idAfter)
 	}
 	if signer != nil {
-		if sub, err := db.signerIdSub(*signer); err != nil {
+		_signer, err := db.db.Signer.FindOrCreateSigner(*signer)
+		if err != nil {
 			return nil, err
-		} else {
-			tx = tx.Where("optimism_signatures.signer_id = (?)", sub)
 		}
+		tx = tx.Where("optimism_signatures.signer_id = ?", _signer.ID)
 	}
 	if scc != nil {
-		if sub, err := db.sccIdSub(*scc); err != nil {
+		_scc, err := db.FindOrCreateSCC(*scc)
+		if err != nil {
 			return nil, err
-		} else {
-			tx = tx.Where("optimism_signatures.optimism_scc_id = (?)", sub)
 		}
+		tx = tx.Where("optimism_signatures.optimism_scc_id = ?", _scc.ID)
 	}
 	if index != nil {
 		tx = tx.Where("optimism_signatures.batch_index = ?", *index)
@@ -339,7 +345,7 @@ func (db *OptimismDatabase) FindSignatures(
 // Delete states after the specified batchIndex.
 func (db *OptimismDatabase) DeleteStates(scc common.Address, batchIndex uint64) (int64, error) {
 	var affected int64
-	err := db.db.Transaction(func(s *gorm.DB) error {
+	err := db.rawdb.Transaction(func(s *gorm.DB) error {
 		var ids []uint64
 		tx := s.
 			Model(&OptimismState{}).
@@ -372,7 +378,7 @@ func (db *OptimismDatabase) DeleteSignatures(
 	batchIndex uint64,
 ) (int64, error) {
 	var affected int64
-	err := db.db.Transaction(func(s *gorm.DB) error {
+	err := db.rawdb.Transaction(func(s *gorm.DB) error {
 		var ids []string
 		tx := s.
 			Model(&OptimismSignature{}).
@@ -400,12 +406,34 @@ func (db *OptimismDatabase) DeleteSignatures(
 	return affected, nil
 }
 
-func (db *OptimismDatabase) sccIdSub(scc common.Address) (*gorm.DB, error) {
-	sub := db.db.Model(&OptimismScc{}).
-		Select("id").
-		Where("address = ?", scc)
-	if sub.Error != nil {
-		return nil, sub.Error
+// for debug
+func (db *OptimismDatabase) SequentialSignaturesFinder(startPrevID string) func() ([]*OptimismSignature, error) {
+	var prevRows []*OptimismSignature
+	return func() ([]*OptimismSignature, error) {
+		var prevIDs []string
+		if prevRows == nil {
+			prevIDs = append(prevIDs, startPrevID)
+		} else {
+			prevIDs = make([]string, len(prevRows))
+			for i, row := range prevRows {
+				prevIDs[i] = row.ID
+			}
+		}
+		if len(prevIDs) == 0 {
+			return nil, nil // reached the head
+		}
+
+		var rows []*OptimismSignature
+		tx := db.rawdb.
+			Joins("Signer").
+			Joins("OptimismScc").
+			Where("optimism_signatures.previous_id IN (?)", prevIDs).
+			Find(&rows)
+		if tx.Error != nil {
+			return nil, tx.Error
+		}
+
+		prevRows = rows
+		return rows, nil
 	}
-	return sub, nil
 }

@@ -20,7 +20,7 @@ type verifyWorkerContext struct {
 	log       log.Logger
 }
 
-type verifyWorker interface {
+type VerifyWorker interface {
 	id() string
 	rpc() string
 	work(*verifyWorkerContext, context.Context)
@@ -75,7 +75,7 @@ func (w *Verifier) Start(ctx context.Context) {
 				if !ok {
 					return true
 				}
-				worker, ok := val.(verifyWorker)
+				worker, ok := val.(VerifyWorker)
 				if !ok {
 					return true
 				}
@@ -90,7 +90,7 @@ func (w *Verifier) Start(ctx context.Context) {
 					handler := func(ctx context.Context, rname string, data interface{}) {
 						defer running.Delete(rname)
 
-						if worker, ok := data.(verifyWorker); ok {
+						if worker, ok := data.(VerifyWorker); ok {
 							worker.work(&verifyWorkerContext{
 								cfg:       w.cfg,
 								db:        w.db,
@@ -114,13 +114,22 @@ func (w *Verifier) SignerContext() *ethutil.SignerContext {
 	return w.signerCtx
 }
 
-func (w *Verifier) AddWorker(worker verifyWorker) {
-	if val, ok := w.workers.Load(worker.id()); !ok {
-		w.workers.Store(worker.id(), worker)
-	} else if exists, ok := val.(verifyWorker); ok && exists.rpc() != worker.rpc() {
-		// If the L2 RPC is changed, replace the worker.
-		w.workers.Store(worker.id(), worker)
+// TODO
+func (w *Verifier) HasWorker(id, rpc string) bool {
+	val, ok := w.workers.Load(id)
+	if !ok {
+		return false
 	}
+	// If the L2 RPC is changed, replace the worker.
+	return rpc == val.(VerifyWorker).rpc()
+}
+
+func (w *Verifier) AddWorker(worker VerifyWorker) {
+	w.workers.Store(worker.id(), worker)
+}
+
+func (w *Verifier) RemoveWorker(id string) {
+	w.workers.Delete(id)
 }
 
 func (s *Verifier) SubscribeNewSignature(ctx context.Context) *SignatureSubscription {

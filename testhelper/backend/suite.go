@@ -6,7 +6,6 @@ import (
 	"math/big"
 	"time"
 
-	"github.com/ethereum/go-ethereum/accounts/abi/bind"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/oasysgames/oasys-optimism-verifier/config"
 	"github.com/oasysgames/oasys-optimism-verifier/contract/l2oo"
@@ -27,7 +26,7 @@ type BackendSuite struct {
 	Hub   *TestBackend
 	Verse *TestBackend
 
-	StakeManager *StakeManagerMock
+	StakeManager *testhelper.StakeManagerMock
 
 	Mcall2     *multicall2.Multicall2
 	Mcall2Addr common.Address
@@ -52,7 +51,7 @@ func (b *BackendSuite) SetupTest() {
 	// setup test chain
 	b.Hub = NewTestBackend()
 	b.Verse = NewTestBackend()
-	b.StakeManager = &StakeManagerMock{}
+	b.StakeManager = &testhelper.StakeManagerMock{}
 
 	// deploy `Multicall2` contract
 	b.Mcall2Addr, _, b.Mcall2, _ = multicall2.DeployMulticall2(b.Hub.TransactOpts(ctx), b.Hub)
@@ -109,58 +108,4 @@ func (b *BackendSuite) EmitOutputProposed(index int) *tl2oo.L2ooOutputProposed {
 	b.Nil(err)
 	b.Mining()
 	return event
-}
-
-type StakeManagerMock struct {
-	Owners     []common.Address
-	Operators  []common.Address
-	Stakes     []*big.Int
-	Candidates []bool
-	NewCursor  *big.Int
-}
-
-func (b *StakeManagerMock) GetTotalStake(
-	callOpts *bind.CallOpts,
-	epoch *big.Int,
-) (*big.Int, error) {
-	tot := new(big.Int)
-	for _, stake := range b.Stakes {
-		tot.Add(tot, stake)
-	}
-	return tot, nil
-}
-
-func (b *StakeManagerMock) GetValidators(
-	callOpts *bind.CallOpts,
-	epoch, cursol, howMany *big.Int,
-) (struct {
-	Owners     []common.Address
-	Operators  []common.Address
-	Stakes     []*big.Int
-	Candidates []bool
-	NewCursor  *big.Int
-}, error) {
-	length := big.NewInt(int64(len(b.Owners)))
-	if new(big.Int).Add(cursol, howMany).Cmp(length) >= 0 {
-		howMany = new(big.Int).Sub(length, cursol)
-	}
-
-	start := cursol.Uint64()
-	end := start + howMany.Uint64()
-
-	ret := struct {
-		Owners     []common.Address
-		Operators  []common.Address
-		Stakes     []*big.Int
-		Candidates []bool
-		NewCursor  *big.Int
-	}{
-		Owners:     b.Owners[start:end],
-		Operators:  b.Operators[start:end],
-		Stakes:     b.Stakes[start:end],
-		Candidates: b.Candidates[start:end],
-		NewCursor:  new(big.Int).Add(cursol, howMany),
-	}
-
-	return ret, nil
 }

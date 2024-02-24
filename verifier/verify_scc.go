@@ -57,7 +57,7 @@ func NewSccVerifyWorker(
 	l2Client ethutil.ReadOnlyClient,
 	sccAddr common.Address,
 	scc *scc.Scc,
-) verifyWorker {
+) VerifyWorker {
 	return &sccVerifyWorker{
 		l2Client: l2Client,
 		sccAddr:  sccAddr,
@@ -218,7 +218,7 @@ func (w *sccVerifyWorker) deleteInvalidSignature(wc *verifyWorkerContext, nextIn
 		new(big.Int).SetUint64(sigs[0].BatchIndex),
 		sigs[0].BatchRoot,
 		sigs[0].Approved)
-	if match, err := msg.VerifySigner(sigs[0].Signature[:], wc.signerCtx.Signer); err == nil && match {
+	if err := msg.VerifySigner(sigs[0].Signature[:], wc.signerCtx.Signer); err == nil {
 		wc.log.Debug("No invalid signature", logCtx...)
 		return
 	} else if err != nil {

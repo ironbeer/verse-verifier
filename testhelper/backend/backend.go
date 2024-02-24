@@ -1,14 +1,12 @@
 package backend
 
 import (
-	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/rand"
 	"io/ioutil"
 	"math/big"
 	"os"
-	"strings"
 
 	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/accounts"
@@ -34,9 +32,7 @@ var (
 )
 
 func init() {
-	// create new wallet and key
-	reader := bytes.NewReader([]byte(strings.Repeat("x", 40)))
-	priv, _ := ecdsa.GenerateKey(crypto.S256(), reader)
+	priv, _ := crypto.HexToECDSA("7878787878787879118f980be9bfb497fd94f02a4adb77fdffea86d8da73e279")
 
 	// setup keystore
 	tempDir, _ := ioutil.TempDir(os.TempDir(), "keystore")

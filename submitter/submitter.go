@@ -50,11 +50,11 @@ func init() {
 }
 
 type Submitter struct {
-	cfg        *config.Submitter
-	db         *database.Database
-	stakeCache *stakemanager.Cache
-	tasks      *sync.Map
-	log        log.Logger
+	cfg          *config.Submitter
+	db           *database.Database
+	stakemanager *stakemanager.Cache
+	tasks        *sync.Map
+	log          log.Logger
 }
 
 func NewSubmitter(
@@ -63,22 +63,16 @@ func NewSubmitter(
 	sm stakemanager.IStakeManager,
 ) *Submitter {
 	return &Submitter{
-		cfg:        cfg,
-		db:         db,
-		stakeCache: stakemanager.NewCache(sm),
-		tasks:      &sync.Map{},
-		log:        log.New("worker", "submitter"),
+		cfg:          cfg,
+		db:           db,
+		stakemanager: stakemanager.NewCache(sm),
+		tasks:        &sync.Map{},
+		log:          log.New("worker", "submitter"),
 	}
 }
 
 func (w *Submitter) Start(ctx context.Context) {
 	wg := &sync.WaitGroup{}
-
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		w.stakeRefreshLoop(ctx)
-	}()
 
 	wg.Add(1)
 	go func() {
@@ -97,22 +91,6 @@ func (w *Submitter) Start(ctx context.Context) {
 
 	wg.Wait()
 	w.log.Info("Worker stopped")
-}
-
-func (w *Submitter) stakeRefreshLoop(ctx context.Context) {
-	tick := util.NewTicker(time.Hour, 1)
-	defer tick.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-tick.C:
-			if err := w.stakeCache.Refresh(ctx); err != nil {
-				w.log.Error("Failed to refresh stakes", "err", err)
-			}
-		}
-	}
 }
 
 func (w *Submitter) workLoop(ctx context.Context) {
@@ -162,8 +140,14 @@ func (w *Submitter) workLoop(ctx context.Context) {
 	}
 }
 
-func (w *Submitter) AddTask(l2ChainId uint64, task *Task) {
-	w.tasks.LoadOrStore(strconv.FormatUint(l2ChainId, 10), task)
+// TODO
+func (w *Submitter) HasTask(l2ChainID uint64, target common.Address) bool {
+	_, ok := w.tasks.Load(strconv.FormatUint(l2ChainID, 10))
+	return ok
+}
+
+func (w *Submitter) AddTask(l2ChainID uint64, task *Task) {
+	w.tasks.LoadOrStore(strconv.FormatUint(l2ChainID, 10), task)
 }
 
 func (w *Submitter) work(ctx context.Context, task *Task) {
@@ -260,7 +244,7 @@ func (w *Submitter) sendMulticallTx(
 		}
 	}
 	if len(calls) == 0 {
-		w.log.Debug("No signatures", logCtx...)
+		w.log.Info("No calldata", logCtx...)
 		return nil, nil
 	}
 
@@ -524,7 +508,7 @@ func (it *sccIterator) next(s *Submitter, opts *bind.TransactOpts) (tx *types.Tr
 	}
 
 	signatures, first, err := getTopStakingSignatures(
-		optimismSignatures(rows), minStake, s.stakeCache.TotalStake(), s.stakeCache.StakeBySigner)
+		optimismSignatures(rows), minStake, s.stakemanager.TotalStake(), s.stakemanager.StakeBySigner)
 	if err != nil {
 		return nil, false, err
 	} else if len(signatures) == 0 {
@@ -582,7 +566,7 @@ func (it *l2ooIterator) next(s *Submitter, opts *bind.TransactOpts) (tx *types.T
 	}
 
 	signatures, first, err := getTopStakingSignatures(
-		opstackSignatures(rows), minStake, s.stakeCache.TotalStake(), s.stakeCache.StakeBySigner)
+		opstackSignatures(rows), minStake, s.stakemanager.TotalStake(), s.stakemanager.StakeBySigner)
 	if err != nil {
 		return nil, false, err
 	} else if len(signatures) == 0 {

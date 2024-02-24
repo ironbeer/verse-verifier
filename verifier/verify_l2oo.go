@@ -22,7 +22,7 @@ func NewL2OOVerifyWorker(
 	l2Client ethutil.ReadOnlyClient,
 	l2ooAddr common.Address,
 	l2oo *l2oo.OasysL2OutputOracle,
-) verifyWorker {
+) VerifyWorker {
 	return &l2ooVerifyWorker{
 		l2Client: l2Client,
 		l2ooAddr: l2ooAddr,
@@ -154,7 +154,7 @@ func (w *l2ooVerifyWorker) deleteInvalidSignature(wc *verifyWorkerContext, nextV
 		new(big.Int).SetUint64(sigs[0].L1Timestamp),
 		new(big.Int).SetUint64(sigs[0].L2BlockNumber),
 		sigs[0].Approved)
-	if match, err := msg.VerifySigner(sigs[0].Signature[:], wc.signerCtx.Signer); err == nil && match {
+	if err := msg.VerifySigner(sigs[0].Signature[:], wc.signerCtx.Signer); err == nil {
 		wc.log.Debug("No invalid signature", logCtx...)
 		return
 	} else if err != nil {

@@ -16,24 +16,24 @@ wallets:
 
 # Hub-Layer settings
 hub_layer:
-  chain_id: 248
-  rpc: wss://ws.mainnet.oasys.games/
+  chain_id: 9372
+  rpc: wss://ws.testnet.oasys.games/
 
 # Verse-Layer settings
 verse_layer:
   discovery:
-    endpoint: https://cdn.oasys.games/_oasvlfy/verse-layers.v1.json
+    endpoint: https://cdn.testnet.oasys.games/_oasvlfy/verse-layers.v1.json
 
 # P2P node
 p2p:
-  listen: 0.0.0.0:4101
+  listens:
+    - /ip4/0.0.0.0/tcp/4101
+    - /ip4/0.0.0.0/udp/4101/quic
   bootnodes:
-    - /ip4/3.113.207.39/tcp/4101/p2p/12D3KooWRcFMyjkMLEQtSbjGiJSL6VQ6LTco4YxfvBeVVAX4rx5Y
-    - /ip4/35.238.159.190/tcp/4101/p2p/12D3KooWJjVoho7nNiwACx6aJH3STC58SjkbkNUsuDwzSPAJHarh
-
-# IPC server
-ipc:
-  enable: true
+    - /ip4/34.142.254.12/tcp/4101/p2p/12D3KooWMQpbQbv9vuGj2dWQHQX6K5oHPupTTSEMNzZWJQqgsBMU
+    - /ip4/34.142.254.12/udp/4101/quic/p2p/12D3KooWMQpbQbv9vuGj2dWQHQX6K5oHPupTTSEMNzZWJQqgsBMU
+  relay_client:
+    enable: true
 
 # Verification worker
 verifier:
@@ -44,5 +44,5 @@ verifier:
 submitter:
   enable: false  # Only enable for Verse Builder
   targets:
-    - chain_id: 420  # Chain ID of your Verse-Layer
+    - chain_id: 420  # Chain ID of your Verse-Layer(testnet)
       wallet: submitter

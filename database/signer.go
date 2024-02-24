@@ -1,32 +1,28 @@
 package database
 
 import (
+	"errors"
+
 	"github.com/ethereum/go-ethereum/common"
 	"gorm.io/gorm"
-	"gorm.io/gorm/clause"
 )
 
 type SignerDatabase struct {
-	db *gorm.DB
+	rawdb *gorm.DB
+	db    *Database
 }
 
-func (db *SignerDatabase) FindOrCreateSigner(signer common.Address) (*Signer, error) {
-	row := &Signer{Address: signer}
-	tx := db.db.Clauses(clause.OnConflict{
-		Columns: []clause.Column{{Name: "address"}},
-	}).Create(row)
-	if tx.Error != nil {
-		return nil, tx.Error
+func (db *SignerDatabase) FindOrCreateSigner(signer common.Address) (row *Signer, err error) {
+	err = db.rawdb.Transaction(func(txdb *gorm.DB) error {
+		tx := txdb.Where("address = ?", signer).First(&row)
+		if errors.Is(tx.Error, gorm.ErrRecordNotFound) {
+			row.Address = signer
+			return txdb.Create(&row).Error
+		}
+		return tx.Error
+	})
+	if err != nil {
+		return nil, err
 	}
 	return row, nil
-}
-
-func (db *SignerDatabase) signerIdSub(signer common.Address) (*gorm.DB, error) {
-	sub := db.db.Model(&Signer{}).
-		Select("id").
-		Where("address = ?", signer)
-	if sub.Error != nil {
-		return nil, sub.Error
-	}
-	return sub, nil
 }

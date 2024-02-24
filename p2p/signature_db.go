@@ -12,14 +12,15 @@ type signatureDB struct {
 	iWrappedDB
 }
 
-func (db *signatureDB) findLatestSignatureId(signer common.Address) (id string, err error) {
+func (db *signatureDB) findLatestSignatureId(signer common.Address) (*string, error) {
 	latests, err := db.findLatestSignaturesBySigner(signer, 1, 0)
 	if err != nil {
-		return "", err
+		return nil, err
 	} else if latests.len() == 0 {
-		return "", nil
+		return nil, nil
 	}
-	return latests.get(0).getID(), nil
+	id := latests.get(0).getID()
+	return &id, nil
 }
 
 func (db *signatureDB) getSignatureExchangeResponse(signer common.Address, idAfter string, limit, offset int) (msg *pb.Stream, count int, err error) {
@@ -46,22 +47,25 @@ func (db *signatureDB) hasSignature(id string, previousID *string) (bool, error)
 func (db *signatureDB) getFindCommonSignatureRequest(
 	signer common.Address,
 	limit, offset int,
-) (msg *pb.Stream, from, to string, err error) {
+) (msg *pb.Stream, count int, fromID, toID string, err error) {
 	// find local latest signatures (order by: id desc)
 	sigs, err := db.findLatestSignaturesBySigner(signer, limit, offset)
 	if err != nil {
-		return nil, "", "", err
+		return nil, 0, "", "", err
 	} else if sigs.len() == 0 {
 		// reached the last
-		return nil, "", "", nil
+		return nil, 0, "", "", nil
 	}
 	return sigs.findCommonSignatureRequest()
 }
 
 func (db *signatureDB) getFindCommonSignatureResponse(
 	req pb.ICommonSignatureRequest,
-) (msg *pb.Stream, found bool, err error) {
+) (msg *pb.Stream, id string, found bool, err error) {
 	sig, err := db.findSignatureByID(req.GetId())
+	if err == nil {
+		id = sig.getID()
+	}
 	found = err == nil && sig.getPreviousID() == req.GetPreviousId()
-	return sig.findCommonSignatureResponse(), found, err
+	return sig.findCommonSignatureResponse(), id, found, err
 }

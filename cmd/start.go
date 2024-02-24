@@ -28,8 +28,10 @@ import (
 	"github.com/oasysgames/oasys-optimism-verifier/contract/sccverifier"
 	"github.com/oasysgames/oasys-optimism-verifier/contract/stakemanager"
 	"github.com/oasysgames/oasys-optimism-verifier/database"
+	"github.com/oasysgames/oasys-optimism-verifier/debug"
 	"github.com/oasysgames/oasys-optimism-verifier/ethutil"
 	"github.com/oasysgames/oasys-optimism-verifier/ipc"
+	"github.com/oasysgames/oasys-optimism-verifier/metrics"
 	"github.com/oasysgames/oasys-optimism-verifier/p2p"
 	submitterpkg "github.com/oasysgames/oasys-optimism-verifier/submitter"
 	"github.com/oasysgames/oasys-optimism-verifier/util"
@@ -54,9 +56,6 @@ var startCmd = &cobra.Command{
 
 func init() {
 	rootCmd.AddCommand(startCmd)
-
-	startCmd.Flags().String(configFlag, "", "configuration file")
-	startCmd.MarkFlagRequired(configFlag)
 }
 
 func runStartCmd(cmd *cobra.Command, args []string) {
@@ -68,14 +67,18 @@ func runStartCmd(cmd *cobra.Command, args []string) {
 
 	s := mustNewServer(cmd)
 
+	// start metrics server
+	s.mustStartMetrics(ctx)
+
+	// start pprof server
+	s.mustStartPprof(ctx)
+
 	// start ipc server
-	// Note: must start the IPC server before unlocking the wallet.
+	// Note: must start the IPC server before unlocking wallets.
 	s.mustStartIPC(ctx)
 
 	// unlock walelts(wait forever)
-	if s.ipc != nil {
-		waitForUnlockWallets(ctx, s.conf, s.ks)
-	}
+	s.waitForUnlockWallets(ctx)
 
 	// start p2p
 	// Note: must start the P2P before setup beacon worker.
@@ -101,6 +104,7 @@ type server struct {
 	db               *database.Database
 	ks               *wallet.KeyStore
 	hub              ethutil.ReadOnlyClient
+	smcache          *stakemanager.Cache
 	ipc              *ipc.IPCServer
 	p2p              *p2p.Node
 	blockCollector   *collector.BlockCollector
@@ -138,21 +142,60 @@ func mustNewServer(cmd *cobra.Command) *server {
 		log.Crit("Failed to construct hub-layer client", "err", err)
 	}
 
+	// construct stakemanager cache
+	sm, err := stakemanager.NewStakemanagerCaller(
+		common.HexToAddress(StakeManagerAddress), s.hub)
+	if err != nil {
+		log.Crit("Failed to construct StakeManager", "err", err)
+	}
+	s.smcache = stakemanager.NewCache(sm)
+
 	return s
 }
 
-func (s *server) mustStartIPC(ctx context.Context) {
-	if !s.conf.IPC.Enable {
+func (s *server) mustStartMetrics(ctx context.Context) {
+	if !s.conf.Metrics.Enable {
 		return
 	}
 
-	ipc, err := ipc.NewIPCServer(commandName)
+	s.wg.Add(1)
+	metrics.Initialize(&s.conf.Metrics)
+
+	go func() {
+		defer s.wg.Done()
+		if err := metrics.ListenAndServe(ctx); err != nil {
+			log.Crit("Failed to start metrics server", "err", err)
+		}
+	}()
+}
+
+func (s *server) mustStartPprof(ctx context.Context) {
+	if !s.conf.Debug.Pprof.Enable {
+		return
+	}
+
+	s.wg.Add(1)
+
+	ps := debug.NewPprofServer(&s.conf.Debug.Pprof)
+	go func() {
+		defer s.wg.Done()
+		if err := ps.ListenAndServe(ctx); err != nil {
+			log.Crit("Failed to start pprof server", "err", err)
+		}
+	}()
+}
+
+func (s *server) mustStartIPC(ctx context.Context) {
+	if s.conf.IPC.Sockname == "" {
+		log.Crit("IPC socket name is required")
+	}
+
+	ipc, err := ipc.NewIPCServer(s.conf.IPC.Sockname)
 	if err != nil {
 		log.Crit("Failed to start ipc server", "err", err)
 	}
 
 	s.ipc = ipc
-	s.ipc.SetHandler(ipccmd.WalletUnlockCmd.NewHandler(s.ks))
 
 	s.wg.Add(1)
 	go func() {
@@ -168,31 +211,10 @@ func (s *server) mustStartP2P(ctx context.Context) {
 		log.Crit("Failed to get(or create) p2p key", "err", err)
 	}
 
-	listen := strings.Split(s.conf.P2P.Listen, ":")
-	host, dht, bwm, err := p2p.NewHost(ctx, listen[0], listen[1], p2pKey)
+	// construct libp2p host
+	host, dht, bwm, hpHelper, err := p2p.NewHost(ctx, &s.conf.P2P, p2pKey)
 	if err != nil {
-		log.Crit("Failed to setup libp2p", "err", err)
-	}
-
-	// etup peer discovery
-	p2p.Bootstrap(ctx, host, dht)
-
-	// connect to bootstrap peers
-	bootnodes := p2p.ConvertPeers(s.conf.P2P.Bootnodes)
-	if len(bootnodes) > 0 {
-		ticker := util.NewTicker(time.Minute, 1)
-		defer ticker.Stop()
-
-		go func() {
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case <-ticker.C:
-					p2p.ConnectPeers(ctx, host, bootnodes)
-				}
-			}
-		}()
+		log.Crit("Failed to construct libp2p host", "err", err)
 	}
 
 	// ignore self-signed signatures
@@ -202,11 +224,14 @@ func (s *server) mustStartP2P(ctx context.Context) {
 		ignoreSigners = append(ignoreSigners, account.Address)
 	}
 
-	s.p2p, err = p2p.NewNode(&s.conf.P2P, s.db,
-		host, dht, bwm, s.conf.HubLayer.ChainId, ignoreSigners)
+	s.p2p, err = p2p.NewNode(&s.conf.P2P, s.db, host, dht, bwm,
+		hpHelper, s.conf.HubLayer.ChainId, ignoreSigners, s.smcache)
 	if err != nil {
 		log.Crit("Failed to construct p2p node", "err", err)
 	}
+
+	s.ipc.SetHandler(ipccmd.PingCmd.NewHandler(ctx, s.p2p.Host(), s.p2p.HolePunchHelper()))
+	s.ipc.SetHandler(ipccmd.StatusCmd.NewHandler(s.p2p.Host()))
 
 	s.wg.Add(1)
 	go func() {
@@ -236,8 +261,10 @@ func (s *server) startVerseDiscovery(ctx context.Context) {
 			select {
 			case <-ctx.Done():
 				return
-			case verse := <-sub.Next():
-				s.discoveredVerses.Store(verse.ChainID, verse)
+			case verses := <-sub.Next():
+				for _, verse := range verses {
+					s.discoveredVerses.Store(verse.ChainID, verse)
+				}
 
 				select {
 				case <-ctx.Done():
@@ -283,7 +310,8 @@ func (s *server) mustSetupSubmitter() {
 		return
 	}
 
-	sm, err := stakemanager.NewStakemanager(common.HexToAddress(StakeManagerAddress), s.hub)
+	sm, err := stakemanager.NewStakemanager(
+		common.HexToAddress(StakeManagerAddress), s.hub)
 	if err != nil {
 		log.Crit("Failed to construct submitter", "err", err)
 	}
@@ -340,16 +368,25 @@ func (s *server) verseNotifyHandler(ctx context.Context) {
 
 		// add verse to Verifier
 		if s.verifier != nil {
-			l2Client, err := ethutil.NewReadOnlyClient(verse.RPC)
-			if err != nil {
-				log.Error("Failed to construct verse-layer client", "err", err)
-				return true
-			}
+			var (
+				workers  []verifierpkg.VerifyWorker
+				l2Client ethutil.ReadOnlyClient
+			)
 			if scc_ != nil {
-				s.verifier.AddWorker(verifierpkg.NewSccVerifyWorker(l2Client, sccAddr, scc_))
+				workers = append(workers, verifierpkg.NewSccVerifyWorker(l2Client, sccAddr, scc_))
 			}
 			if l2oo_ != nil {
-				s.verifier.AddWorker(verifierpkg.NewL2OOVerifyWorker(l2Client, l2ooAddr, l2oo_))
+				workers = append(workers, verifierpkg.NewL2OOVerifyWorker(l2Client, l2ooAddr, l2oo_))
+			}
+			if len(workers) > 0 {
+				l2Client, err = ethutil.NewReadOnlyClient(verse.RPC)
+				if err != nil {
+					log.Error("Failed to construct verse-layer client", "err", err)
+					return true
+				}
+				for _, worker := range workers {
+					s.verifier.AddWorker(worker)
+				}
 			}
 		}
 
@@ -385,6 +422,7 @@ func (s *server) verseNotifyHandler(ctx context.Context) {
 					}
 				}
 
+				// TODO
 				if scc_ != nil {
 					task, err := submitterpkg.NewTask(
 						l1Client, sccAddr, scc_, verifier, multicall)
@@ -431,8 +469,16 @@ func (s *server) start(ctx context.Context) {
 		}()
 	}
 
+	// start cache updater
+	s.smcache.Refresh(ctx) // first time synchronous
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		s.smcache.RefreshLoop(ctx, time.Hour)
+	}()
+
+	// start verifier
 	if s.verifier != nil {
-		// start verifier
 		s.wg.Add(1)
 		go func() {
 			defer s.wg.Done()
@@ -444,6 +490,7 @@ func (s *server) start(ctx context.Context) {
 		go func() {
 			defer s.wg.Done()
 
+			// optimize database every hour
 			tick := util.NewTicker(s.conf.Verifier.OptimizeInterval, 1)
 			defer tick.Stop()
 
@@ -452,6 +499,7 @@ func (s *server) start(ctx context.Context) {
 				case <-ctx.Done():
 					return
 				case <-tick.C:
+					// TODO
 					s.db.Optimism.RepairPreviousID(s.verifier.SignerContext().Signer)
 				}
 			}
@@ -465,6 +513,10 @@ func (s *server) start(ctx context.Context) {
 			sub := s.verifier.SubscribeNewSignature(ctx)
 			defer sub.Cancel()
 
+			debounce := time.NewTicker(time.Second * 5)
+			defer debounce.Stop()
+
+			var optimisms, opstacks sync.Map
 			for {
 				select {
 				case <-ctx.Done():
@@ -472,10 +524,26 @@ func (s *server) start(ctx context.Context) {
 				case sig := <-sub.Next():
 					switch t := sig.(type) {
 					case *database.OptimismSignature:
-						s.p2p.PublishSignatures(ctx, []*database.OptimismSignature{t}, nil)
+						optimisms.Store(t.Signer.Address, t)
 					case *database.OpstackSignature:
-						s.p2p.PublishSignatures(ctx, nil, []*database.OpstackSignature{t})
+						opstacks.Store(t.Signer.Address, t)
 					}
+				case <-debounce.C:
+					// TODO
+					var (
+						pubOptimisms []*database.OptimismSignature
+						pubOpstacks  []*database.OpstackSignature
+					)
+					optimisms.Range(func(_, value any) bool {
+						pubOptimisms = append(pubOptimisms, value.(*database.OptimismSignature))
+						return true
+					})
+					opstacks.Range(func(_, value any) bool {
+						pubOpstacks = append(pubOpstacks, value.(*database.OpstackSignature))
+						return true
+					})
+					optimisms, opstacks = sync.Map{}, sync.Map{}
+					s.p2p.PublishSignatures(ctx, pubOptimisms, pubOpstacks)
 				}
 			}
 		}()
@@ -490,15 +558,9 @@ func (s *server) start(ctx context.Context) {
 		}()
 	}
 
-	// start verse discovery
-	s.wg.Add(1)
-	go func() {
-		defer s.wg.Done()
-		s.startVerseDiscovery(ctx)
-	}()
-
-	// start verse handler
+	// start verse discovery handler
 	if s.verifier != nil || s.submitter != nil {
+		// read verses in the configuration file
 		for _, verse := range s.conf.VerseLayer.Directs {
 			s.discoveredVerses.Store(verse.ChainID, verse)
 		}
@@ -520,6 +582,13 @@ func (s *server) start(ctx context.Context) {
 			}
 		}()
 	}
+
+	// start dynamic verse discovery
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		s.startVerseDiscovery(ctx)
+	}()
 
 	// start beacon worker
 	if s.bw != nil {
@@ -572,15 +641,17 @@ func getOrCreateP2PKey(filename string) (crypto.PrivKey, error) {
 	return priv, nil
 }
 
-func waitForUnlockWallets(ctx context.Context, c *config.Config, ks *wallet.KeyStore) {
-	wg := &sync.WaitGroup{}
-	wg.Add(len(c.Wallets))
+func (s *server) waitForUnlockWallets(ctx context.Context) {
+	s.ipc.SetHandler(ipccmd.WalletUnlockCmd.NewHandler(s.ks))
 
-	for name, wallet := range c.Wallets {
+	var wg sync.WaitGroup
+	wg.Add(len(s.conf.Wallets))
+
+	for name, wallet := range s.conf.Wallets {
 		go func(name string, wallet config.Wallet) {
 			defer wg.Done()
 
-			_wallet, account, err := ks.FindWallet(common.HexToAddress(wallet.Address))
+			_wallet, account, err := s.ks.FindWallet(common.HexToAddress(wallet.Address))
 			if err != nil {
 				log.Crit("Failed to find a wallet",
 					"name", name, "address", wallet.Address, "err", err)
@@ -594,13 +665,13 @@ func waitForUnlockWallets(ctx context.Context, c *config.Config, ks *wallet.KeyS
 						"name", name, "address", wallet.Address, "err", err)
 				}
 
-				if err := ks.Unlock(*account, strings.Trim(string(b), "\r\n\t ")); err != nil {
+				if err := s.ks.Unlock(*account, strings.Trim(string(b), "\r\n\t ")); err != nil {
 					log.Crit("Failed to unlock wallet using password file",
 						"name", name, "address", wallet.Address, "err", err)
 				}
-			} else if ks.Unlock(*account, "") != nil {
+			} else if s.ks.Unlock(*account, "") != nil {
 				log.Info("Waiting for wallet unlock", "name", name, "address", wallet.Address)
-				if err := ks.WaitForUnlock(ctx, _wallet); err != nil {
+				if err := s.ks.WaitForUnlock(ctx, _wallet); err != nil {
 					log.Crit("Wallet was not unlocked",
 						"name", name, "address", wallet.Address, "err", err)
 				}

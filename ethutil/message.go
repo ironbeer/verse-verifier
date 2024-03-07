@@ -1,4 +1,4 @@
-package verifier
+package ethutil
 
 import (
 	"bytes"
@@ -8,7 +8,6 @@ import (
 	"github.com/ethereum/go-ethereum/accounts"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/crypto"
-	"github.com/oasysgames/oasys-optimism-verifier/ethutil"
 )
 
 type SignerMismatchError struct {
@@ -24,7 +23,7 @@ type Message struct {
 	Eip712Msg string
 }
 
-func (m *Message) Signature(signDataFn ethutil.SignDataFn) ([65]byte, error) {
+func (m *Message) Signature(signDataFn SignDataFn) ([65]byte, error) {
 	var sig [65]byte
 	signed, err := signDataFn([]byte(m.Eip712Msg))
 	if err != nil {
@@ -39,7 +38,7 @@ func (m *Message) Signature(signDataFn ethutil.SignDataFn) ([65]byte, error) {
 
 func (m *Message) Ecrecover(signature []byte) (common.Address, error) {
 	hash := crypto.Keccak256([]byte(m.Eip712Msg))
-	return ethutil.Ecrecover(hash, signature)
+	return Ecrecover(hash, signature)
 }
 
 func (m *Message) VerifySigner(signature []byte, signer common.Address) error {
@@ -51,46 +50,18 @@ func (m *Message) VerifySigner(signature []byte, signer common.Address) error {
 	return nil
 }
 
-// Returns a verification message for the rollup of a legacy verse(StateCommitmentChain).
-func NewSccMessage(
+func NewMessage(
 	hubChainID *big.Int,
-	scc common.Address,
-	batchIndex *big.Int,
-	batchRoot [32]byte,
-	approved bool,
-) *Message {
-	// See: https://github.com/oasysgames/oasys-optimism/blob/5186190c3250121179064b70d8e2fbd2d0a03ce3/packages/contracts/contracts/oasys/L1/rollup/OasysStateCommitmentChainVerifier.sol#L111-L119
-	abiPacked := bytes.Join([][]byte{
-		padUint256(hubChainID),
-		scc[:],
-		padUint256(batchIndex),
-		batchRoot[:],
-		padBool(approved),
-	}, nil)
-	_, msg := accounts.TextAndHash(crypto.Keccak256(abiPacked))
-
-	return &Message{AbiPacked: abiPacked, Eip712Msg: msg}
-}
-
-// Returns a verification message for the rollup of a verse(L2OutputOracle).
-func NewL2ooMessage(
-	hubChainID *big.Int,
-	l2oo_ common.Address,
-	l2OutputIndex *big.Int,
-	outputRoot common.Hash,
-	l1Timestamp *big.Int,
-	l2BlockNumber *big.Int,
+	contract common.Address,
+	rollupIndex *big.Int,
+	rollupHash [32]byte,
 	approved bool,
 ) *Message {
 	abiPacked := bytes.Join([][]byte{
 		padUint256(hubChainID),
-		l2oo_[:],
-		padUint256(l2OutputIndex),
-		bytes.Join([][]byte{
-			outputRoot[:],
-			padUint128(l1Timestamp),
-			padUint128(l2BlockNumber),
-		}, nil),
+		contract[:],
+		padUint256(rollupIndex),
+		rollupHash[:],
 		padBool(approved),
 	}, nil)
 	_, msg := accounts.TextAndHash(crypto.Keccak256(abiPacked))
@@ -101,11 +72,11 @@ func NewL2ooMessage(
 // Deprecated: This is a signature with a bug in the boolean type abi-encode.
 // It is retained for verification purposes because there are peers still
 // sending signatures containing the bug.
-func NewSCCMessageWithApprovedBug(
+func NewMessageWithApprovedBug(
 	hubChainID *big.Int,
 	scc common.Address,
-	batchIndex *big.Int,
-	batchRoot [32]byte,
+	rollupIndex *big.Int,
+	rollupHash [32]byte,
 	approved bool,
 ) *Message {
 	b := common.Big0
@@ -116,13 +87,21 @@ func NewSCCMessageWithApprovedBug(
 	abiPacked := bytes.Join([][]byte{
 		common.LeftPadBytes(hubChainID.Bytes(), 32),
 		scc[:],
-		common.LeftPadBytes(batchIndex.Bytes(), 32),
-		batchRoot[:],
+		common.LeftPadBytes(rollupIndex.Bytes(), 32),
+		rollupHash[:],
 		b.Bytes(),
 	}, nil)
 	_, msg := accounts.TextAndHash(crypto.Keccak256(abiPacked))
 
 	return &Message{AbiPacked: abiPacked, Eip712Msg: msg}
+}
+
+func L2OORollupHashSource(outputRoot common.Hash, l1Timestamp, l2BlockNumber *big.Int) []byte {
+	return bytes.Join([][]byte{
+		outputRoot[:],
+		padUint128(l1Timestamp),
+		padUint128(l2BlockNumber),
+	}, nil)
 }
 
 func padUint128(val *big.Int) []byte {

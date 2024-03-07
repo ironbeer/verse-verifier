@@ -22,10 +22,6 @@ import (
 	"github.com/oasysgames/oasys-optimism-verifier/cmd/ipccmd"
 	"github.com/oasysgames/oasys-optimism-verifier/collector"
 	"github.com/oasysgames/oasys-optimism-verifier/config"
-	"github.com/oasysgames/oasys-optimism-verifier/contract/l2oo"
-	"github.com/oasysgames/oasys-optimism-verifier/contract/multicall2"
-	"github.com/oasysgames/oasys-optimism-verifier/contract/scc"
-	"github.com/oasysgames/oasys-optimism-verifier/contract/sccverifier"
 	"github.com/oasysgames/oasys-optimism-verifier/contract/stakemanager"
 	"github.com/oasysgames/oasys-optimism-verifier/database"
 	"github.com/oasysgames/oasys-optimism-verifier/debug"
@@ -36,14 +32,13 @@ import (
 	submitterpkg "github.com/oasysgames/oasys-optimism-verifier/submitter"
 	"github.com/oasysgames/oasys-optimism-verifier/util"
 	verifierpkg "github.com/oasysgames/oasys-optimism-verifier/verifier"
+	"github.com/oasysgames/oasys-optimism-verifier/verse"
 	"github.com/oasysgames/oasys-optimism-verifier/version"
 	"github.com/oasysgames/oasys-optimism-verifier/wallet"
 	"github.com/spf13/cobra"
 )
 
 const (
-	SccName             = "StateCommitmentChain"
-	L2OOName            = "L2OutputOracle"
 	StakeManagerAddress = "0x0000000000000000000000000000000000001001"
 )
 
@@ -103,7 +98,7 @@ type server struct {
 	conf             *config.Config
 	db               *database.Database
 	ks               *wallet.KeyStore
-	hub              ethutil.ReadOnlyClient
+	hub              ethutil.Client
 	smcache          *stakemanager.Cache
 	ipc              *ipc.IPCServer
 	p2p              *p2p.Node
@@ -112,14 +107,13 @@ type server struct {
 	verifier         *verifierpkg.Verifier
 	submitter        *submitterpkg.Submitter
 	bw               *beacon.BeaconWorker
-	discoveredVerses sync.Map
-	discoveredNotify chan struct{}
+	discoveredVerses chan []*config.Verse
 }
 
 func mustNewServer(cmd *cobra.Command) *server {
 	var err error
 
-	s := &server{discoveredNotify: make(chan struct{}, 1)}
+	s := &server{discoveredVerses: make(chan []*config.Verse)}
 
 	// load configuration file
 	if s.conf, err = loadConfig(cmd); err != nil {
@@ -138,7 +132,7 @@ func mustNewServer(cmd *cobra.Command) *server {
 	s.ks = wallet.NewKeyStore(s.conf.KeyStore)
 
 	// construct hub-layer client
-	if s.hub, err = ethutil.NewReadOnlyClient(s.conf.HubLayer.RPC); err != nil {
+	if s.hub, err = ethutil.NewClient(s.conf.HubLayer.RPC); err != nil {
 		log.Crit("Failed to construct hub-layer client", "err", err)
 	}
 
@@ -261,16 +255,7 @@ func (s *server) startVerseDiscovery(ctx context.Context) {
 			select {
 			case <-ctx.Done():
 				return
-			case verses := <-sub.Next():
-				for _, verse := range verses {
-					s.discoveredVerses.Store(verse.ChainID, verse)
-				}
-
-				select {
-				case <-ctx.Done():
-					return
-				case s.discoveredNotify <- struct{}{}:
-				}
+			case s.discoveredVerses <- <-sub.Next():
 			}
 		}
 	}()
@@ -296,7 +281,7 @@ func (s *server) mustSetupVerifier() {
 	}
 
 	wallet, account := findWallet(s.conf, s.ks, s.conf.Verifier.Wallet)
-	signer, err := ethutil.NewWritableClient(
+	signer, err := ethutil.NewSignableClient(
 		new(big.Int).SetUint64(s.conf.HubLayer.ChainId), s.conf.HubLayer.RPC, wallet, account)
 	if err != nil {
 		log.Crit("Failed to construct verifier", "err", err)
@@ -336,118 +321,69 @@ func (s *server) setupBeacon() {
 	)
 }
 
-func (s *server) verseNotifyHandler(ctx context.Context) {
-	s.discoveredVerses.Range(func(key, value any) bool {
-		verse, ok := value.(*config.Verse)
-		if !ok {
-			return true
-		}
+func (s *server) verseNotifyHandler(discovers []*config.Verse) {
+	if s.verifier == nil && s.submitter == nil {
+		log.Warn("Both Verifier and Submitter are disabled")
+		return
+	}
 
-		var err error
+	verseFactories := map[string]verse.VerseFactory{
+		"StateCommitmentChain": verse.NewOPLegacy,
+		"L2OutputOracle":       verse.NewOPStack,
+	}
+	verifyContracts := map[string]common.Address{
+		"StateCommitmentChain": common.HexToAddress(s.conf.Submitter.SCCVerifierAddress),
+		"L2OutputOracle":       common.HexToAddress(s.conf.Submitter.L2OOVerifierAddress),
+	}
 
-		// construct rollup contract
-		var scc_ *scc.Scc
-		sccAddr := common.HexToAddress(verse.L1Contracts[SccName])
-		if sccAddr != (common.Address{}) {
-			if scc_, err = scc.NewScc(sccAddr, s.hub); err != nil {
-				log.Error("Failed to construct OasysStateCommitmentChain client", "err", err)
-				return true
+	type verse_ struct {
+		cfg    *config.Verse
+		verse  verse.Verse
+		verify common.Address
+	}
+	var verses []*verse_
+	for _, cfg := range discovers {
+		for name, addr := range cfg.L1Contracts {
+			if factory, ok := verseFactories[name]; ok {
+				verses = append(verses, &verse_{
+					cfg:    cfg,
+					verse:  factory(s.db, s.hub, common.HexToAddress(addr)),
+					verify: verifyContracts[name],
+				})
 			}
 		}
-		var l2oo_ *l2oo.OasysL2OutputOracle
-		l2ooAddr := common.HexToAddress(verse.L1Contracts[L2OOName])
-		if l2ooAddr != (common.Address{}) {
-			if l2oo_, err = l2oo.NewOasysL2OutputOracle(l2ooAddr, s.hub); err != nil {
-				log.Error("Failed to construct OasysL2OutputOracle client", "err", err)
-				return true
-			}
-		}
-		if scc_ == nil && l2oo_ == nil {
-			return true
-		}
+	}
 
+	for _, x := range verses {
 		// add verse to Verifier
-		if s.verifier != nil {
-			var (
-				workers  []verifierpkg.VerifyWorker
-				l2Client ethutil.ReadOnlyClient
-			)
-			if scc_ != nil {
-				workers = append(workers, verifierpkg.NewSccVerifyWorker(l2Client, sccAddr, scc_))
-			}
-			if l2oo_ != nil {
-				workers = append(workers, verifierpkg.NewL2OOVerifyWorker(l2Client, l2ooAddr, l2oo_))
-			}
-			if len(workers) > 0 {
-				l2Client, err = ethutil.NewReadOnlyClient(verse.RPC)
-				if err != nil {
-					log.Error("Failed to construct verse-layer client", "err", err)
-					return true
-				}
-				for _, worker := range workers {
-					s.verifier.AddWorker(worker)
-				}
+		if s.verifier != nil && !s.verifier.HasTask(x.verse.RollupContract(), x.cfg.RPC) {
+			l2Client, err := ethutil.NewClient(x.cfg.RPC)
+			if err != nil {
+				log.Error("Failed to construct verse-layer client", "err", err)
+			} else {
+				s.verifier.AddTask(x.verse.WithVerifiable(l2Client))
 			}
 		}
 
 		// add verse to Submitter
 		if s.submitter != nil {
-			for _, t := range s.conf.Submitter.Targets {
-				if t.ChainID != verse.ChainID {
+			for _, tg := range s.conf.Submitter.Targets {
+				if tg.ChainID != x.cfg.ChainID || s.submitter.HasTask(x.verse.RollupContract()) {
 					continue
 				}
 
-				wallet, account := findWallet(s.conf, s.ks, t.Wallet)
-				l1Client, err := ethutil.NewWritableClient(
-					new(big.Int).SetUint64(s.conf.HubLayer.ChainId), s.conf.HubLayer.RPC, wallet, account)
+				wallet, account := findWallet(s.conf, s.ks, tg.Wallet)
+				l1Signer, err := ethutil.NewSignableClient(
+					new(big.Int).SetUint64(s.conf.HubLayer.ChainId),
+					s.conf.HubLayer.RPC, wallet, account)
 				if err != nil {
 					log.Error("Failed to construct hub-layer client", "err", err)
-					return true
+				} else {
+					s.submitter.AddTask(x.verse.WithTransactable(l1Signer, x.verify))
 				}
-
-				verifier, err := sccverifier.NewOasysRollupVerifier(
-					common.HexToAddress(s.conf.Submitter.VerifierAddress), l1Client)
-				if err != nil {
-					log.Error("Failed to construct OasysRollupVerifier contract", "err", err)
-					return true
-				}
-
-				var multicall *multicall2.Multicall2
-				if s.conf.Submitter.UseMulticall {
-					multicall, err = multicall2.NewMulticall2(
-						common.HexToAddress(s.conf.Submitter.Multicall2Address), l1Client)
-					if err != nil {
-						log.Error("Failed to construct OasysRollupVerifier contract", "err", err)
-						return true
-					}
-				}
-
-				// TODO
-				if scc_ != nil {
-					task, err := submitterpkg.NewTask(
-						l1Client, sccAddr, scc_, verifier, multicall)
-					if err != nil {
-						log.Error("Failed to add SCC contract submit task", "err", err)
-					} else {
-						s.submitter.AddTask(t.ChainID, task)
-					}
-				}
-				if l2oo_ != nil {
-					task, err := submitterpkg.NewTask(
-						l1Client, l2ooAddr, l2oo_, verifier, multicall)
-					if err != nil {
-						log.Error("Failed to add L2OO contract submit task", "err", err)
-					} else {
-						s.submitter.AddTask(t.ChainID, task)
-					}
-				}
-
-				break
 			}
 		}
-
-		return true
-	})
+	}
 }
 
 func (s *server) start(ctx context.Context) {
@@ -499,8 +435,7 @@ func (s *server) start(ctx context.Context) {
 				case <-ctx.Done():
 					return
 				case <-tick.C:
-					// TODO
-					s.db.Optimism.RepairPreviousID(s.verifier.SignerContext().Signer)
+					s.db.OPSignature.RepairPreviousID(s.verifier.SignerContext().Signer)
 				}
 			}
 		}()
@@ -516,34 +451,23 @@ func (s *server) start(ctx context.Context) {
 			debounce := time.NewTicker(time.Second * 5)
 			defer debounce.Stop()
 
-			var optimisms, opstacks sync.Map
+			subscribes := map[common.Address]*database.OptimismSignature{}
 			for {
 				select {
 				case <-ctx.Done():
 					return
 				case sig := <-sub.Next():
-					switch t := sig.(type) {
-					case *database.OptimismSignature:
-						optimisms.Store(t.Signer.Address, t)
-					case *database.OpstackSignature:
-						opstacks.Store(t.Signer.Address, t)
-					}
+					subscribes[sig.Signer.Address] = sig
 				case <-debounce.C:
-					// TODO
-					var (
-						pubOptimisms []*database.OptimismSignature
-						pubOpstacks  []*database.OpstackSignature
-					)
-					optimisms.Range(func(_, value any) bool {
-						pubOptimisms = append(pubOptimisms, value.(*database.OptimismSignature))
-						return true
-					})
-					opstacks.Range(func(_, value any) bool {
-						pubOpstacks = append(pubOpstacks, value.(*database.OpstackSignature))
-						return true
-					})
-					optimisms, opstacks = sync.Map{}, sync.Map{}
-					s.p2p.PublishSignatures(ctx, pubOptimisms, pubOpstacks)
+					if len(subscribes) == 0 {
+						continue
+					}
+					var publishes []*database.OptimismSignature
+					for _, sig := range subscribes {
+						publishes = append(publishes, sig)
+					}
+					s.p2p.PublishSignatures(ctx, publishes)
+					subscribes = map[common.Address]*database.OptimismSignature{}
 				}
 			}
 		}()
@@ -559,29 +483,24 @@ func (s *server) start(ctx context.Context) {
 	}
 
 	// start verse discovery handler
-	if s.verifier != nil || s.submitter != nil {
-		// read verses in the configuration file
-		for _, verse := range s.conf.VerseLayer.Directs {
-			s.discoveredVerses.Store(verse.ChainID, verse)
-		}
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+
+		// read verses from the configuration
 		go func() {
-			s.discoveredNotify <- struct{}{}
+			s.discoveredVerses <- s.conf.VerseLayer.Directs
 		}()
 
-		s.wg.Add(1)
-		go func() {
-			defer s.wg.Done()
-
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case <-s.discoveredNotify:
-					s.verseNotifyHandler(ctx)
-				}
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case verses := <-s.discoveredVerses:
+				s.verseNotifyHandler(verses)
 			}
-		}()
-	}
+		}
+	}()
 
 	// start dynamic verse discovery
 	s.wg.Add(1)

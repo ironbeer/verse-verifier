@@ -8,13 +8,10 @@ import (
 	"gorm.io/gorm"
 )
 
-type BlockDatabase struct {
-	rawdb *gorm.DB
-	db    *Database
-}
+type BlockDB modeldb
 
 // Return the specific block.
-func (db *BlockDatabase) Find(number uint64) (*Block, error) {
+func (db *BlockDB) Find(number uint64) (*Block, error) {
 	var row Block
 	tx := db.rawdb.
 		Where("number = ?", number).
@@ -27,7 +24,7 @@ func (db *BlockDatabase) Find(number uint64) (*Block, error) {
 }
 
 // Return the highest block.
-func (db *BlockDatabase) FindHighest() (*Block, error) {
+func (db *BlockDB) FindHighest() (*Block, error) {
 	var rows []*Block
 	tx := db.rawdb.
 		Order("number DESC").
@@ -43,7 +40,7 @@ func (db *BlockDatabase) FindHighest() (*Block, error) {
 }
 
 // Returns blocks for uncollected event logs(order by block number).
-func (db *BlockDatabase) FindUncollecteds(limit int) ([]*Block, error) {
+func (db *BlockDB) FindUncollecteds(limit int) ([]*Block, error) {
 	tx := db.rawdb.
 		Order("number ASC").
 		Limit(limit)
@@ -67,13 +64,13 @@ func (db *BlockDatabase) FindUncollecteds(limit int) ([]*Block, error) {
 }
 
 // Save the new block.
-func (db *BlockDatabase) SaveNewBlock(number uint64, hash common.Hash) error {
+func (db *BlockDB) Save(number uint64, hash common.Hash) error {
 	tx := db.rawdb.Create(&Block{Number: number, Hash: hash})
 	return tx.Error
 }
 
 // Save event log collected block.
-func (db *BlockDatabase) SaveCollected(number uint64, hash common.Hash) error {
+func (db *BlockDB) SaveCollected(number uint64, hash common.Hash) error {
 	return db.rawdb.Transaction(func(tx *gorm.DB) error {
 		block, err := newDB(tx).Block.Find(number)
 		if err != nil {
@@ -88,7 +85,7 @@ func (db *BlockDatabase) SaveCollected(number uint64, hash common.Hash) error {
 }
 
 // Delete blocks after the number.
-func (db *BlockDatabase) Deletes(after uint64) error {
+func (db *BlockDB) Deletes(after uint64) error {
 	return db.rawdb.Transaction(func(txdb *gorm.DB) error {
 		tx := txdb.
 			Where("number >= ?", after).

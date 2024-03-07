@@ -12,19 +12,19 @@ import (
 	"github.com/stretchr/testify/suite"
 )
 
-func TestBlockDatabase(t *testing.T) {
-	suite.Run(t, new(BlockDatabaseTestSuite))
+func TestBlockDB(t *testing.T) {
+	suite.Run(t, new(BlockDBTestSuite))
 }
 
-type BlockDatabaseTestSuite struct {
+type BlockDBTestSuite struct {
 	testhelper.Suite
 
-	db      *BlockDatabase
+	db      *BlockDB
 	rawdb   *gorm.DB
 	creates []*Block
 }
 
-func (s *BlockDatabaseTestSuite) SetupTest() {
+func (s *BlockDBTestSuite) SetupTest() {
 	db, err := NewDatabase(&config.Database{Path: ":memory:"})
 	if err != nil {
 		panic(err)
@@ -45,21 +45,21 @@ func (s *BlockDatabaseTestSuite) SetupTest() {
 	s.creates = append([]*Block{nil}, s.creates...) // padding
 }
 
-func (s *BlockDatabaseTestSuite) TestFind() {
+func (s *BlockDBTestSuite) TestFind() {
 	got, _ := s.db.Find(10)
 	s.Equal(uint64(10), got.Number)
 	s.Equal(s.ItoHash(10), got.Hash)
 	s.Equal(false, got.LogCollected)
 }
 
-func (s *BlockDatabaseTestSuite) TestFindHighest() {
+func (s *BlockDBTestSuite) TestFindHighest() {
 	got, _ := s.db.FindHighest()
 	s.Equal(uint64(50), got.Number)
 	s.Equal(s.ItoHash(50), got.Hash)
 	s.Equal(false, got.LogCollected)
 }
 
-func (s *BlockDatabaseTestSuite) TestFindUncollecteds() {
+func (s *BlockDBTestSuite) TestFindUncollecteds() {
 	assertGots := func(gots []*Block, expNumbers []int) {
 		s.Equal(len(expNumbers), len(gots))
 
@@ -113,10 +113,10 @@ func (s *BlockDatabaseTestSuite) TestFindUncollecteds() {
 	})
 }
 
-func (s *BlockDatabaseTestSuite) TestSave() {
+func (s *BlockDBTestSuite) TestSave() {
 	number := uint64(100)
 
-	s.db.SaveNewBlock(number, s.ItoHash(int(number)))
+	s.db.Save(number, s.ItoHash(int(number)))
 
 	got, _ := s.db.Find(number)
 	s.Equal(number, got.Number)
@@ -124,7 +124,7 @@ func (s *BlockDatabaseTestSuite) TestSave() {
 	s.Equal(false, got.LogCollected)
 }
 
-func (s *BlockDatabaseTestSuite) TestSaveCollected() {
+func (s *BlockDBTestSuite) TestSaveCollected() {
 	s.NoError(s.db.SaveCollected(10, s.creates[10].Hash))
 	collected, _ := findCollectedBlock(s.rawdb)
 	s.Equal(uint64(10), collected)
@@ -140,7 +140,7 @@ func (s *BlockDatabaseTestSuite) TestSaveCollected() {
 	s.ErrorContains(err, "this block was removed due to reorganization")
 }
 
-func (s *BlockDatabaseTestSuite) TestDeletes() {
+func (s *BlockDBTestSuite) TestDeletes() {
 	s.NoError(s.db.Deletes(26))
 
 	_, err := s.db.Find(25)

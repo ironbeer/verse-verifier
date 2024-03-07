@@ -2,37 +2,27 @@ package verifier
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"time"
 
+	"github.com/ethereum/go-ethereum/accounts/abi/bind"
+	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/oasysgames/oasys-optimism-verifier/config"
 	"github.com/oasysgames/oasys-optimism-verifier/database"
 	"github.com/oasysgames/oasys-optimism-verifier/ethutil"
 	"github.com/oasysgames/oasys-optimism-verifier/util"
+	"github.com/oasysgames/oasys-optimism-verifier/verse"
 )
 
-type verifyWorkerContext struct {
-	cfg       *config.Verifier
-	db        *database.Database
-	signerCtx *ethutil.SignerContext
-	topic     *util.Topic
-	log       log.Logger
-}
-
-type VerifyWorker interface {
-	id() string
-	rpc() string
-	work(*verifyWorkerContext, context.Context)
-}
-
-// Worker to verify the events of OasysStateCommitmentChain.
+// Worker to verify rollups.
 type Verifier struct {
 	cfg       *config.Verifier
 	db        *database.Database
 	signerCtx *ethutil.SignerContext
 	topic     *util.Topic
-	workers   *sync.Map
+	tasks     sync.Map
 	log       log.Logger
 }
 
@@ -43,7 +33,6 @@ func NewVerifier(cfg *config.Verifier, db *database.Database, signerCtx *ethutil
 		db:        db,
 		signerCtx: signerCtx,
 		topic:     util.NewTopic(),
-		workers:   &sync.Map{},
 		log:       log.New("worker", "verifier"),
 	}
 }
@@ -70,40 +59,25 @@ func (w *Verifier) Start(ctx context.Context) {
 			w.log.Info("Worker stopped")
 			return
 		case <-tick.C:
-			w.workers.Range(func(key, val interface{}) bool {
-				id, ok := key.(string)
-				if !ok {
-					return true
-				}
-				worker, ok := val.(VerifyWorker)
-				if !ok {
-					return true
-				}
+			w.tasks.Range(func(key, val interface{}) bool {
+				workerID := key.(common.Address).Hex()
+				task := val.(verse.VerifiableVerse)
 
 				// deduplication
-				if _, ok := running.Load(id); ok {
+				if _, ok := running.Load(workerID); ok {
 					return true
 				}
-				running.Store(id, 1)
+				running.Store(workerID, 1)
 
-				if !wg.Has(id) {
-					handler := func(ctx context.Context, rname string, data interface{}) {
+				if !wg.Has(workerID) {
+					worker := func(ctx context.Context, rname string, data interface{}) {
 						defer running.Delete(rname)
-
-						if worker, ok := data.(VerifyWorker); ok {
-							worker.work(&verifyWorkerContext{
-								cfg:       w.cfg,
-								db:        w.db,
-								signerCtx: w.signerCtx,
-								topic:     w.topic,
-								log:       w.log.New(),
-							}, ctx)
-						}
+						w.work(ctx, data.(verse.VerifiableVerse))
 					}
-					wg.AddWorker(ctx, id, handler)
+					wg.AddWorker(ctx, workerID, worker)
 				}
 
-				wg.Enqueue(id, worker)
+				wg.Enqueue(workerID, task)
 				return true
 			})
 		}
@@ -114,37 +88,147 @@ func (w *Verifier) SignerContext() *ethutil.SignerContext {
 	return w.signerCtx
 }
 
-// TODO
-func (w *Verifier) HasWorker(id, rpc string) bool {
-	val, ok := w.workers.Load(id)
-	if !ok {
+func (w *Verifier) HasTask(contract common.Address, l2RPC string) bool {
+	if val, ok := w.tasks.Load(contract); !ok {
 		return false
+	} else {
+		// If the L2 RPC is changed, replace the worker.
+		return l2RPC == val.(verse.VerifiableVerse).L2Client().URL()
 	}
-	// If the L2 RPC is changed, replace the worker.
-	return rpc == val.(VerifyWorker).rpc()
 }
 
-func (w *Verifier) AddWorker(worker VerifyWorker) {
-	w.workers.Store(worker.id(), worker)
+func (w *Verifier) AddTask(task verse.VerifiableVerse) {
+	task.Logger(w.log).Info("Add verifier task")
+	w.tasks.Store(task.RollupContract(), task)
 }
 
-func (w *Verifier) RemoveWorker(id string) {
-	w.workers.Delete(id)
+func (w *Verifier) RemoveTask(contract common.Address) {
+	w.tasks.Delete(contract)
 }
 
 func (s *Verifier) SubscribeNewSignature(ctx context.Context) *SignatureSubscription {
-	ch := make(chan interface{})
+	ch := make(chan *database.OptimismSignature)
 	cancel := s.topic.Subscribe(ctx, func(ctx context.Context, data interface{}) {
-		ch <- data
+		ch <- data.(*database.OptimismSignature)
 	})
 	return &SignatureSubscription{Cancel: cancel, ch: ch}
 }
 
-type SignatureSubscription struct {
-	Cancel context.CancelFunc
-	ch     chan interface{}
+func (vr *Verifier) work(ctx context.Context, task verse.VerifiableVerse) {
+	log := task.Logger(vr.log)
+
+	// fetch the next index from hub-layer
+	nextIndex, err := task.NextIndex(&bind.CallOpts{Context: ctx})
+	if err != nil {
+		log.Error("Failed to call the NextIndex method", "err", err)
+		return
+	}
+
+	// verify the signature that match the nextIndex
+	// and delete after signatures if there is a problem.
+	// Prevent getting stuck indefinitely in the Verify waiting
+	// event due to a bug in the signature creation process.
+	vr.deleteInvalidNextIndexSignature(task, nextIndex.Uint64())
+
+	// run verification tasks until time out
+	ctx, cancel := context.WithTimeout(ctx, vr.cfg.StateCollectTimeout)
+	defer cancel()
+
+	for rollupIndex := nextIndex.Uint64(); ; rollupIndex++ {
+		log := log.New("rollup-index", rollupIndex)
+
+		events, err := task.EventDB().FindForVerification(
+			vr.signerCtx.Signer, task.RollupContract(), rollupIndex, 1)
+		if err != nil {
+			log.Error("Failed to find rollup events", "err", err)
+			return
+		} else if len(events) == 0 {
+			log.Debug("Wait for new rollup event")
+			return
+		}
+
+		log.Info("Start verification")
+		approved, err := task.Verify(vr.log, ctx, events[0], vr.cfg.StateCollectLimit)
+		if err != nil {
+			log.Error("Failed to verification", "err", err)
+			return
+		}
+
+		msg := database.NewMessage(events[0], vr.signerCtx.ChainID, approved)
+		sig, err := msg.Signature(vr.signerCtx.SignData)
+		if err != nil {
+			log.Error("Failed to calculate signature", "err", err)
+			return
+		}
+
+		opsig, err := vr.db.OPSignature.Save(
+			nil, nil,
+			vr.signerCtx.Signer,
+			events[0].GetContract().Address,
+			events[0].GetRollupIndex(),
+			events[0].GetRollupHash(),
+			approved,
+			sig)
+		if err != nil {
+			log.Error("Failed to save signature", "err", err)
+			return
+		}
+
+		log.Info("Verification completed", "approved", approved)
+		vr.topic.Publish(opsig)
+	}
 }
 
-func (s *SignatureSubscription) Next() <-chan interface{} {
+func (vr *Verifier) deleteInvalidNextIndexSignature(task verse.VerifiableVerse, nextIndex uint64) {
+	log := task.Logger(vr.log).New("next-index", nextIndex)
+
+	contract := task.RollupContract()
+	sigs, err := vr.db.OPSignature.Find(
+		nil, &vr.signerCtx.Signer, &contract, &nextIndex, 1, 0)
+	if err != nil {
+		log.Error("Unable to find signatures", "err", err)
+		return
+	} else if len(sigs) == 0 {
+		return
+	}
+
+	event, err := task.EventDB().FindByRollupIndex(task.RollupContract(), nextIndex)
+	if err != nil {
+		if errors.Is(err, database.ErrNotFound) {
+			log.Debug("No rollup event")
+		} else {
+			log.Error("Unable to find rollup event", "err", err)
+		}
+		return
+	}
+
+	err = database.NewMessage(event, vr.signerCtx.ChainID, true).
+		VerifySigner(sigs[0].Signature[:], vr.signerCtx.Signer)
+	if _, ok := err.(*ethutil.SignerMismatchError); ok {
+		// possible reject signature
+		err = database.NewMessage(event, vr.signerCtx.ChainID, false).
+			VerifySigner(sigs[0].Signature[:], vr.signerCtx.Signer)
+	}
+	if err == nil {
+		log.Debug("No invalid signature")
+		return
+	}
+
+	log.Warn("Found invalid signature", "signature", sigs[0].Signature.Hex())
+
+	if rows, err := vr.db.OPSignature.Deletes(
+		vr.signerCtx.Signer, task.RollupContract(), nextIndex); err != nil {
+		log.Error("Failed to delete signatures", "err", err)
+	} else {
+		log.Warn("Deleted invalid signatures", "delete-rows", rows)
+	}
+}
+
+type SignatureSubscription struct {
+	Cancel context.CancelFunc
+	ch     chan *database.OptimismSignature
+}
+
+func (s *SignatureSubscription) Next() <-chan *database.OptimismSignature {
 	return s.ch
 }

@@ -56,7 +56,7 @@ func (o *OpstackOutputV0) OutputRoot() common.Hash {
 	return crypto.Keccak256Hash(marshaled)
 }
 
-func GetOpstackOutputV0(ctx context.Context, client ReadOnlyClient, account common.Address, storageKeys []string, block uint64) (*OpstackOutputV0, error) {
+func GetOpstackOutputV0(ctx context.Context, client Client, account common.Address, storageKeys []string, block uint64) (*OpstackOutputV0, error) {
 	// Fetch the L2 Block of Rollup Target
 	head, err := client.HeaderByNumber(ctx, new(big.Int).SetUint64(block))
 	if err != nil {

@@ -7,14 +7,17 @@ import (
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/oasysgames/oasys-optimism-verifier/config"
 	"github.com/oasysgames/oasys-optimism-verifier/contract/l2oo"
+	"github.com/oasysgames/oasys-optimism-verifier/contract/l2ooverifier"
 	"github.com/oasysgames/oasys-optimism-verifier/contract/multicall2"
 	"github.com/oasysgames/oasys-optimism-verifier/contract/scc"
 	"github.com/oasysgames/oasys-optimism-verifier/contract/sccverifier"
 	"github.com/oasysgames/oasys-optimism-verifier/database"
 	"github.com/oasysgames/oasys-optimism-verifier/testhelper"
 	tl2oo "github.com/oasysgames/oasys-optimism-verifier/testhelper/contract/l2oo"
+	tl2oov "github.com/oasysgames/oasys-optimism-verifier/testhelper/contract/l2ooverifier"
 	tscc "github.com/oasysgames/oasys-optimism-verifier/testhelper/contract/scc"
 	tsccv "github.com/oasysgames/oasys-optimism-verifier/testhelper/contract/sccverifier"
 )
@@ -22,14 +25,16 @@ import (
 type BackendSuite struct {
 	testhelper.Suite
 
-	DB    *database.Database
-	Hub   *TestBackend
-	Verse *TestBackend
+	DB *database.Database
+
+	Hub, Verse *Backend
+	SignableHub,
+	SignableVerse *SignableBackend
 
 	StakeManager *testhelper.StakeManagerMock
 
-	Mcall2     *multicall2.Multicall2
-	Mcall2Addr common.Address
+	Multicall     *multicall2.Multicall2
+	MulticallAddr common.Address
 
 	SCC     *scc.Scc
 	TSCC    *tscc.Scc
@@ -39,47 +44,61 @@ type BackendSuite struct {
 	TL2OO    *tl2oo.L2oo
 	L2OOAddr common.Address
 
-	SCCV     *sccverifier.OasysRollupVerifier
-	TSCCV    *tsccv.Sccverifier
-	SCCVAddr common.Address
+	SCCV      *sccverifier.OasysRollupVerifier
+	L2OOV     *l2ooverifier.OasysL2OutputOracleVerifier
+	TSCCV     *tsccv.Sccverifier
+	TL2OOV    *tl2oov.L2ooverifier
+	SCCVAddr  common.Address
+	L2OOVAddr common.Address
 }
 
 func (b *BackendSuite) SetupTest() {
 	ctx := context.Background()
 	b.DB, _ = database.NewDatabase(&config.Database{Path: ":memory:"})
-
-	// setup test chain
-	b.Hub = NewTestBackend()
-	b.Verse = NewTestBackend()
 	b.StakeManager = &testhelper.StakeManagerMock{}
 
+	// setup test chain
+	b.Hub = NewBackend(nil, 0)
+	b.Verse = NewBackend(nil, 0)
+	b.SignableHub = NewSignableBackend(b.Hub, nil, nil)
+	b.SignableVerse = NewSignableBackend(b.Verse, nil, nil)
+
 	// deploy `Multicall2` contract
-	b.Mcall2Addr, _, b.Mcall2, _ = multicall2.DeployMulticall2(b.Hub.TransactOpts(ctx), b.Hub)
-	b.Hub.Mining()
+	b.MulticallAddr, _, b.Multicall, _ = multicall2.DeployMulticall2(b.SignableHub.TransactOpts(ctx), b.SignableHub)
+	b.SignableHub.Mining()
 
 	// deploy `StateCommitmentChain` contract
-	b.SCCAddr, _, b.TSCC, _ = tscc.DeployScc(b.Hub.TransactOpts(ctx), b.Hub)
-	b.SCC, _ = scc.NewScc(b.SCCAddr, b.Hub)
-	b.Hub.Mining()
+	b.SCCAddr, _, b.TSCC, _ = tscc.DeployScc(b.SignableHub.TransactOpts(ctx), b.SignableHub)
+	b.SCC, _ = scc.NewScc(b.SCCAddr, b.SignableHub)
+	b.SignableHub.Mining()
 
 	// deploy `OasysL2OutputOracle` contract
-	b.L2OOAddr, _, b.TL2OO, _ = tl2oo.DeployL2oo(b.Hub.TransactOpts(ctx), b.Hub)
-	b.L2OO, _ = l2oo.NewOasysL2OutputOracle(b.L2OOAddr, b.Hub)
-	b.Hub.Mining()
+	b.L2OOAddr, _, b.TL2OO, _ = tl2oo.DeployL2oo(b.SignableHub.TransactOpts(ctx), b.SignableHub)
+	b.L2OO, _ = l2oo.NewOasysL2OutputOracle(b.L2OOAddr, b.SignableHub)
+	b.SignableHub.Mining()
 
 	// deploy `OasysRollupVerifier` contract
-	b.SCCVAddr, _, b.TSCCV, _ = tsccv.DeploySccverifier(b.Hub.TransactOpts(ctx), b.Hub)
-	b.SCCV, _ = sccverifier.NewOasysRollupVerifier(b.SCCVAddr, b.Hub)
-	b.Hub.Mining()
+	b.SCCVAddr, _, b.TSCCV, _ = tsccv.DeploySccverifier(b.SignableHub.TransactOpts(ctx), b.SignableHub)
+	b.SCCV, _ = sccverifier.NewOasysRollupVerifier(b.SCCVAddr, b.SignableHub)
+	b.SignableHub.Mining()
+
+	// deploy `OasysL2OutputOracleVerifier` contract
+	b.L2OOVAddr, _, b.TL2OOV, _ = tl2oov.DeployL2ooverifier(b.SignableHub.TransactOpts(ctx), b.SignableHub)
+	b.L2OOV, _ = l2ooverifier.NewOasysL2OutputOracleVerifier(b.L2OOVAddr, b.SignableHub)
+	b.SignableHub.Mining()
 }
 
 func (b *BackendSuite) Mining() {
-	b.Hub.Commit()
-	header, _ := b.Hub.HeaderByNumber(context.Background(), nil)
-	b.DB.Block.SaveNewBlock(header.Number.Uint64(), header.Hash())
+	b.NotEmpty(b.SignableHub.Commit())
+	header, err := b.SignableHub.HeaderByNumber(context.Background(), nil)
+	b.NoError(err)
+	b.DB.Block.Save(header.Number.Uint64(), header.Hash())
 }
 
-func (b *BackendSuite) EmitStateBatchAppended(index int) *tscc.SccStateBatchAppended {
+func (b *BackendSuite) EmitStateBatchAppended(index int) (
+	*types.Transaction,
+	*tscc.SccStateBatchAppended,
+) {
 	i64 := int64(index)
 	event := &tscc.SccStateBatchAppended{
 		BatchIndex:        big.NewInt(i64),
@@ -88,24 +107,27 @@ func (b *BackendSuite) EmitStateBatchAppended(index int) *tscc.SccStateBatchAppe
 		PrevTotalElements: big.NewInt(i64 * 10),
 		ExtraData:         []byte(fmt.Sprintf("ExtraData-%d", index)),
 	}
-	b.TSCC.EmitStateBatchAppended(
-		b.Hub.TransactOpts(context.Background()), event.BatchIndex,
+	tx, err := b.TSCC.EmitStateBatchAppended(
+		b.SignableHub.TransactOpts(context.Background()), event.BatchIndex,
 		event.BatchRoot, event.BatchSize, event.PrevTotalElements, event.ExtraData)
+	b.NoError(err)
 	b.Mining()
-	return event
-
+	return tx, event
 }
 
-func (b *BackendSuite) EmitOutputProposed(index int) *tl2oo.L2ooOutputProposed {
+func (b *BackendSuite) EmitOutputProposed(index int) (
+	*types.Transaction,
+	*tl2oo.L2ooOutputProposed,
+) {
 	event := &tl2oo.L2ooOutputProposed{
 		OutputRoot:    b.RandHash(),
 		L2OutputIndex: big.NewInt(int64(index)),
 		L2BlockNumber: big.NewInt(int64((index + 1) * 10)),
 		L1Timestamp:   big.NewInt(time.Now().Unix()),
 	}
-	_, err := b.TL2OO.EmitOutputProposed(b.Hub.TransactOpts(context.Background()),
+	tx, err := b.TL2OO.EmitOutputProposed(b.SignableHub.TransactOpts(context.Background()),
 		event.OutputRoot, event.L2OutputIndex, event.L2BlockNumber, event.L1Timestamp)
-	b.Nil(err)
+	b.NoError(err)
 	b.Mining()
-	return event
+	return tx, event
 }

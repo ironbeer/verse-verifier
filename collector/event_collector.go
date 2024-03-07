@@ -4,100 +4,22 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"math/big"
-	"strings"
 	"time"
 
-	"github.com/ethereum/go-ethereum"
-	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/oasysgames/oasys-optimism-verifier/config"
-	"github.com/oasysgames/oasys-optimism-verifier/contract/l2oo"
-	"github.com/oasysgames/oasys-optimism-verifier/contract/scc"
 	"github.com/oasysgames/oasys-optimism-verifier/database"
 	"github.com/oasysgames/oasys-optimism-verifier/ethutil"
+	"github.com/oasysgames/oasys-optimism-verifier/verse"
 )
-
-type logProcessor struct {
-	abi          *abi.ABI
-	name         string
-	log2event    func(log types.Log) interface{}
-	eventHandler func(w *EventCollector, tx *database.Database, event interface{}) error
-}
-
-var (
-	filterTopics [][]common.Hash
-	processors   []*logProcessor
-)
-
-func init() {
-	// Events of legacy optimism
-	if parsed, err := abi.JSON(strings.NewReader(scc.SccABI)); err != nil {
-		panic(err)
-	} else {
-		processors = append(processors,
-			&logProcessor{
-				abi:          &parsed,
-				name:         "StateBatchAppended",
-				log2event:    func(log types.Log) interface{} { return &scc.SccStateBatchAppended{Raw: log} },
-				eventHandler: handleStateBatchAppendedEvent,
-			},
-			&logProcessor{
-				abi:          &parsed,
-				name:         "StateBatchDeleted",
-				log2event:    func(log types.Log) interface{} { return &scc.SccStateBatchDeleted{Raw: log} },
-				eventHandler: handleStateBatchDeletedEvent,
-			},
-			&logProcessor{
-				abi:          &parsed,
-				name:         "StateBatchVerified",
-				log2event:    func(log types.Log) interface{} { return &scc.SccStateBatchVerified{Raw: log} },
-				eventHandler: handleStateBatchVerifiedEvent,
-			})
-	}
-
-	// Events of opstack
-	if parsed, err := abi.JSON(strings.NewReader(l2oo.OasysL2OutputOracleABI)); err != nil {
-		panic(err)
-	} else {
-		processors = append(processors,
-			&logProcessor{
-				abi:          &parsed,
-				name:         "OutputProposed",
-				log2event:    func(log types.Log) interface{} { return &l2oo.OasysL2OutputOracleOutputProposed{Raw: log} },
-				eventHandler: handleOutputProposedEvent,
-			},
-			&logProcessor{
-				abi:          &parsed,
-				name:         "OutputsDeleted",
-				log2event:    func(log types.Log) interface{} { return &l2oo.OasysL2OutputOracleOutputsDeleted{Raw: log} },
-				eventHandler: handleOutputsDeletedEvent,
-			},
-			&logProcessor{
-				abi:          &parsed,
-				name:         "OutputVerified",
-				log2event:    func(log types.Log) interface{} { return &l2oo.OasysL2OutputOracleOutputVerified{Raw: log} },
-				eventHandler: handleOutputVerifiedEvent,
-			})
-	}
-
-	filterTopics = append(filterTopics, []common.Hash{})
-	for _, p := range processors {
-		if ae, ok := p.abi.Events[p.name]; !ok {
-			panic(fmt.Sprintf("Failed to get event topic(name=%s) from ABI.", p.name))
-		} else {
-			filterTopics[0] = append(filterTopics[0], ae.ID)
-		}
-	}
-}
 
 // Worker to collect events for OasysStateCommitmentChain.
 type EventCollector struct {
 	cfg    *config.Verifier
 	db     *database.Database
-	hub    ethutil.ReadOnlyClient
+	hub    ethutil.Client
 	signer common.Address
 	log    log.Logger
 }
@@ -105,7 +27,7 @@ type EventCollector struct {
 func NewEventCollector(
 	cfg *config.Verifier,
 	db *database.Database,
-	hub ethutil.ReadOnlyClient,
+	hub ethutil.Client,
 	signer common.Address,
 ) *EventCollector {
 	return &EventCollector{
@@ -149,12 +71,7 @@ func (w *EventCollector) work(ctx context.Context) {
 
 		// collect event logs from hub-layer
 		start, end := blocks[0], blocks[len(blocks)-1]
-		filter := ethereum.FilterQuery{
-			Topics:    filterTopics,
-			FromBlock: new(big.Int).SetUint64(start.Number),
-			ToBlock:   new(big.Int).SetUint64(end.Number),
-		}
-		logs, err := w.hub.FilterLogs(ctx, filter)
+		logs, err := w.hub.FilterLogs(ctx, verse.NewEventLogFilter(start.Number, end.Number))
 		if err != nil {
 			w.log.Error("Failed to fetch event logs from hub-layer",
 				"start", start, "end", end, "err", err)
@@ -166,7 +83,7 @@ func (w *EventCollector) work(ctx context.Context) {
 
 		if err = w.db.Transaction(func(tx *database.Database) error {
 			for _, log := range logs {
-				if err := w.processLog(tx, log); err != nil {
+				if err := w.handleLog(tx, &log); err != nil {
 					return err
 				}
 			}
@@ -181,237 +98,93 @@ func (w *EventCollector) work(ctx context.Context) {
 	}
 }
 
-// Parse event logs and save to database.
-func (w *EventCollector) processLog(tx *database.Database, log types.Log) error {
-	var processor *logProcessor
-	for _, p := range processors {
-		if p.abi.Events[p.name].ID == log.Topics[0] {
-			processor = p
-			break
-		}
-	}
-	if processor == nil {
-		return fmt.Errorf("unknown log topic: %s", log.Topics[0])
+// Handler for event log from rollup contracts.
+func (w *EventCollector) handleLog(tx *database.Database, log *types.Log) error {
+	event, err := verse.ParseEventLog(log)
+	if err != nil {
+		return err
 	}
 
-	event := processor.log2event(log)
-	if err := processor.abi.UnpackIntoInterface(event, processor.name, log.Data); err != nil {
-		return fmt.Errorf("failed to unpack log data: %w", err)
+	err = nil
+	switch t := event.(type) {
+	case *verse.RollupedEvent:
+		err = w.handleRollupedEvent(tx, t)
+	case *verse.DeletedEvent:
+		err = w.handleDeletedEvent(tx, t)
+	case *verse.VerifiedEvent:
+		err = w.handleVerifiedEvent(tx, t)
+	default:
+		err = fmt.Errorf("unknown event")
 	}
 
-	var indexed abi.Arguments
-	for _, arg := range processor.abi.Events[processor.name].Inputs {
-		if arg.Indexed {
-			indexed = append(indexed, arg)
-		}
-	}
-
-	if err := abi.ParseTopics(event, indexed, log.Topics[1:]); err != nil {
-		return fmt.Errorf("failed to parse indexed log data: %w", err)
-	}
-
-	return processor.eventHandler(w, tx, event)
+	return err
 }
 
-// Event handlers for StateCommitmentChain of Legacy Optimism
-func handleStateBatchAppendedEvent(w *EventCollector, tx *database.Database, event interface{}) error {
-	e, ok := event.(*scc.SccStateBatchAppended)
-	if !ok {
-		return fmt.Errorf("event type mismatch(%v)", event)
-	}
+// Handler for new rollup event.
+func (w *EventCollector) handleRollupedEvent(txdb *database.Database, e *verse.RollupedEvent) error {
+	eventDB := e.EventDB(txdb)
 
-	var (
-		address    = e.Raw.Address
-		batchIndex = e.BatchIndex.Uint64()
-		logCtx     = []interface{}{
-			"block", e.Raw.BlockNumber,
-			"scc", address.Hex(),
-			"index", batchIndex,
-		}
-	)
-	w.log.Info("New SCC.StateBatchAppended event", logCtx...)
+	log := e.Logger(w.log)
+	log.Info("New rollup event")
 
-	// delete the `OptimismState` records in consideration of chain reorganization
-	if rows, err := tx.Optimism.DeleteStates(address, batchIndex); err != nil {
-		w.log.Error("Failed to delete reorganized states", append(logCtx, "err", err)...)
+	// delete saved events after the this event index for possible chain reorganization.
+	if rows, err := eventDB.Deletes(e.Log.Address, e.RollupIndex); err != nil {
+		log.Error("Failed to delete reorganized events", "err", err)
 		return err
 	} else if rows > 0 {
-		w.log.Info("Deleted reorganized states", append(logCtx, "rows", rows)...)
+		log.Info("Deleted reorganized events", "rows", rows)
 	}
 
-	// delete the `OptimismSignature` records in consideration of chain reorganization
-	if rows, err := tx.Optimism.DeleteSignatures(w.signer, address, batchIndex); err != nil {
-		w.log.Error("Failed to delete reorganized signatures",
-			append(logCtx, "err", err)...)
+	// delete saved signatures after the this event index for possible chain reorganization.
+	rows, err := txdb.OPSignature.Deletes(w.signer, e.Log.Address, e.RollupIndex)
+	if err != nil {
+		log.Error("Failed to delete reorganized signatures", "err", err)
 		return err
 	} else if rows > 0 {
-		w.log.Info("Deleted reorganized signatures", append(logCtx, "rows", rows)...)
+		log.Info("Deleted reorganized signatures", "rows", rows)
 	}
 
-	// save new state
-	if _, err := tx.Optimism.SaveState(e); err != nil {
-		w.log.Error("Failed to save SCC.StateBatchAppended event", append(logCtx, "err", err)...)
+	if _, err := eventDB.Save(e.Log.Address, e.Parsed); err != nil {
+		log.Error("Failed to save rollup event", "err", err)
 		return err
-	}
-	return nil
-}
-
-func handleStateBatchDeletedEvent(w *EventCollector, tx *database.Database, event interface{}) error {
-	e, ok := event.(*scc.SccStateBatchDeleted)
-	if !ok {
-		return fmt.Errorf("event type mismatch(%v)", event)
-	}
-
-	var (
-		address    = e.Raw.Address
-		batchIndex = e.BatchIndex.Uint64()
-		logCtx     = []interface{}{
-			"block", e.Raw.BlockNumber,
-			"scc", address.Hex(),
-			"index", batchIndex,
-		}
-	)
-	w.log.Info("New SCC.StateBatchDeleted event", logCtx...)
-
-	// delete `OptimismState` records after target batchIndex
-	if rows, err := tx.Optimism.DeleteStates(address, batchIndex); err != nil {
-		w.log.Error("Failed to delete states", append(logCtx, "err", err)...)
-		return err
-	} else if rows > 0 {
-		w.log.Info("Deleted states", append(logCtx, "rows", rows)...)
-	}
-
-	// delete the `OptimismSignature` records in consideration of chain reorganization
-	if rows, err := tx.Optimism.DeleteSignatures(w.signer, address, batchIndex); err != nil {
-		w.log.Error("Failed to delete reorganized signatures", append(logCtx, "err", err)...)
-		return err
-	} else if rows > 0 {
-		w.log.Info("Deleted reorganized signatures", append(logCtx, "rows", rows)...)
 	}
 
 	return nil
 }
 
-func handleStateBatchVerifiedEvent(w *EventCollector, tx *database.Database, event interface{}) error {
-	e, ok := event.(*scc.SccStateBatchVerified)
-	if !ok {
-		return fmt.Errorf("event type mismatch(%v)", event)
-	}
+// Handler for rollup delete event.
+func (w *EventCollector) handleDeletedEvent(txdb *database.Database, e *verse.DeletedEvent) error {
+	eventDB := e.EventDB(txdb)
 
-	nextIndex := e.BatchIndex.Uint64() + 1
+	log := e.Logger(w.log)
+	log.Info("New rollup delete event")
 
-	logCtx := []interface{}{
-		"block", e.Raw.BlockNumber,
-		"scc", e.Raw.Address.Hex(),
-		"next_index", nextIndex,
-	}
-	w.log.Info("New SCC.StateBatchVerified event", logCtx...)
-
-	if err := tx.Optimism.SaveNextIndex(e.Raw.Address, nextIndex); err != nil {
-		w.log.Error("Failed to save next index", append(logCtx, "err", err)...)
-		return err
-	}
-	return nil
-}
-
-// Event handlers for L2OutputOracle of OPStack
-func handleOutputProposedEvent(w *EventCollector, tx *database.Database, event interface{}) error {
-	e, ok := event.(*l2oo.OasysL2OutputOracleOutputProposed)
-	if !ok {
-		return fmt.Errorf("event type mismatch(%v)", event)
-	}
-
-	var (
-		address     = e.Raw.Address
-		outputIndex = e.L2OutputIndex.Uint64()
-		logCtx      = []interface{}{
-			"block", e.Raw.BlockNumber,
-			"l2oo", address.Hex(),
-			"l2-output-index", outputIndex,
-			"l2-block", e.L2BlockNumber.Uint64(),
-			"l1-timestamp", e.L1Timestamp.Uint64(),
-		}
-	)
-	w.log.Info("New L2OO.OutputProposed event", logCtx...)
-
-	// delete the `OPStackProposal` records in consideration of chain reorganization
-	if rows, err := tx.OPStack.DeleteProposals(address, outputIndex); err != nil {
-		w.log.Error("Failed to delete reorganized proposals", append(logCtx, "err", err)...)
+	// delete saved events after the this event index
+	if rows, err := eventDB.Deletes(e.Log.Address, e.RollupIndex); err != nil {
+		log.Error("Failed to delete events", "err", err)
 		return err
 	} else if rows > 0 {
-		w.log.Info("Deleted reorganized proposals", append(logCtx, "rows", rows)...)
+		log.Info("Deleted events", "rows", rows)
 	}
 
-	// delete the `OPStackSignature` records in consideration of chain reorganization
-	if rows, err := tx.OPStack.DeleteSignatures(w.signer, address, outputIndex); err != nil {
-		w.log.Error("Failed to delete reorganized signatures",
-			append(logCtx, "err", err)...)
+	// delete saved signatures after the this event index
+	if rows, err := txdb.OPSignature.Deletes(w.signer, e.Log.Address, e.RollupIndex); err != nil {
+		log.Error("Failed to delete signatures", "err", err)
 		return err
 	} else if rows > 0 {
-		w.log.Info("Deleted reorganized signatures", append(logCtx, "rows", rows)...)
-	}
-
-	// save new state
-	if _, err := tx.OPStack.SaveProposal(e); err != nil {
-		w.log.Error("Failed to save L2OO.OutputProposed event", append(logCtx, "err", err)...)
-		return err
-	}
-	return nil
-}
-
-func handleOutputsDeletedEvent(w *EventCollector, tx *database.Database, event interface{}) error {
-	e, ok := event.(*l2oo.OasysL2OutputOracleOutputsDeleted)
-	if !ok {
-		return fmt.Errorf("event type mismatch(%v)", event)
-	}
-
-	var (
-		address     = e.Raw.Address
-		outputIndex = e.NewNextOutputIndex.Uint64()
-		logCtx      = []interface{}{
-			"block", e.Raw.BlockNumber,
-			"l2oo", address.Hex(),
-			"index", outputIndex,
-		}
-	)
-	w.log.Info("New L2OO.OutputsDeleted event", logCtx...)
-
-	// delete `OPStackProposal` records after target outputIndex
-	if rows, err := tx.OPStack.DeleteProposals(address, outputIndex); err != nil {
-		w.log.Error("Failed to delete states", append(logCtx, "err", err)...)
-		return err
-	} else if rows > 0 {
-		w.log.Info("Deleted states", append(logCtx, "rows", rows)...)
-	}
-
-	// delete the `OPStackSignature` records in consideration of chain reorganization
-	if rows, err := tx.OPStack.DeleteSignatures(w.signer, address, outputIndex); err != nil {
-		w.log.Error("Failed to delete reorganized signatures", append(logCtx, "err", err)...)
-		return err
-	} else if rows > 0 {
-		w.log.Info("Deleted reorganized signatures", append(logCtx, "rows", rows)...)
+		log.Info("Deleted signatures", "rows", rows)
 	}
 
 	return nil
 }
 
-func handleOutputVerifiedEvent(w *EventCollector, tx *database.Database, event interface{}) error {
-	e, ok := event.(*l2oo.OasysL2OutputOracleOutputVerified)
-	if !ok {
-		return fmt.Errorf("event type mismatch(%v)", event)
-	}
+// Handler for rollup verified event.
+func (w *EventCollector) handleVerifiedEvent(txdb *database.Database, e *verse.VerifiedEvent) error {
+	log := e.Logger(w.log)
+	log.Info("New rollup verified event")
 
-	nextVerifyIndex := e.L2OutputIndex.Uint64() + 1
-
-	logCtx := []interface{}{
-		"block", e.Raw.BlockNumber,
-		"l2oo", e.Raw.Address.Hex(),
-		"next-verify-index", nextVerifyIndex,
-	}
-	w.log.Info("New L2OO.OutputVerified event", logCtx...)
-
-	if err := tx.OPStack.SaveNextVerifyIndex(e.Raw.Address, nextVerifyIndex); err != nil {
-		w.log.Error("Failed to save next index", append(logCtx, "err", err)...)
+	if err := txdb.OPContract.SaveNextIndex(e.Log.Address, e.RollupIndex+1); err != nil {
+		log.Error("Failed to save next index", "err", err)
 		return err
 	}
 	return nil

@@ -5,9 +5,10 @@ package message;
 option go_package = "./pb";
 
 message PubSub {
-  optional bytes misc = 1;
-  optional OptimismSignatureExchange optimism_signature_exchange = 2;
-  optional OpstackSignatureExchange opstack_signature_exchange = 3; // Added
+  oneof body {
+    bytes misc = 1;
+    OptimismSignatureExchange optimism_signature_exchange = 2;
+  }
 }
 
 message Stream {
@@ -16,8 +17,6 @@ message Stream {
     bytes eom = 2;
     OptimismSignatureExchange optimism_signature_exchange = 3;
     FindCommonOptimismSignature find_common_optimism_signature = 4;
-    OpstackSignatureExchange opstack_signature_exchange = 5;      // Added
-    FindCommonOpstackSignature find_common_opstack_signature = 6; // Added
   }
 }
 
@@ -25,27 +24,14 @@ message OptimismSignature {
   string id = 1;
   string previous_id = 2;
   bytes signer = 3;
-  bytes scc = 4;
-  uint64 batch_index = 5;
-  bytes batch_root = 6;
-  uint64 batch_size = 7;
-  uint64 prev_total_elements = 8;
-  bytes extra_data = 9;
+  bytes contract = 4;
+  uint64 rollup_index = 5;
+  bytes rollup_hash = 6;
+  uint64 batch_size = 7 [ deprecated = true ];
+  uint64 prev_total_elements = 8 [ deprecated = true ];
+  bytes extra_data = 9 [ deprecated = true ];
   bool approved = 10;
   bytes signature = 11;
-}
-
-message OpstackSignature {
-  string id = 1;
-  string previous_id = 2;
-  bytes signer = 3;
-  bytes l2oo = 4;
-  uint64 l2_output_index = 5;
-  bytes output_root = 6;
-  uint64 l2_block_number = 7;
-  uint64 l1_timestamp = 8;
-  bool approved = 9;
-  bytes signature = 10;
 }
 
 message OptimismSignatureExchange {
@@ -59,30 +45,9 @@ message OptimismSignatureExchange {
   }
 }
 
-message OpstackSignatureExchange {
-  repeated OpstackSignature latests = 1;
-  repeated Request requests = 2;
-  repeated OpstackSignature responses = 3;
-
-  message Request {
-    bytes signer = 1;
-    string id_after = 2;
-  }
-}
-
 message FindCommonOptimismSignature {
   repeated Local locals = 1;
   optional OptimismSignature found = 2;
-
-  message Local {
-    string id = 1;
-    string previous_id = 2;
-  }
-}
-
-message FindCommonOpstackSignature {
-  repeated Local locals = 1;
-  optional OpstackSignature found = 2;
 
   message Local {
     string id = 1;

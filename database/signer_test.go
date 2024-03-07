@@ -6,22 +6,22 @@ import (
 	"github.com/stretchr/testify/suite"
 )
 
-func TestSignerDatabase(t *testing.T) {
-	suite.Run(t, new(SignerDatabaseTestSuite))
+func TestSignerDB(t *testing.T) {
+	suite.Run(t, new(SignerDBTestSuite))
 }
 
-type SignerDatabaseTestSuite struct {
+type SignerDBTestSuite struct {
 	DatabaseTestSuite
 
-	db *SignerDatabase
+	db *SignerDB
 }
 
-func (s *SignerDatabaseTestSuite) SetupTest() {
+func (s *SignerDBTestSuite) SetupTest() {
 	s.DatabaseTestSuite.SetupTest()
 	s.db = s.DatabaseTestSuite.db.Signer
 }
 
-func (s *SignerDatabaseTestSuite) TestFindOrCreateSigner() {
+func (s *SignerDBTestSuite) TestFindOrCreate() {
 	assert := func(got1, got2, got3 *Signer) {
 		var count int
 		s.rawdb.Table("signers").Select("COUNT(*)").Row().Scan(&count)
@@ -39,13 +39,13 @@ func (s *SignerDatabaseTestSuite) TestFindOrCreateSigner() {
 	addr2 := s.ItoAddress(2)
 	addr3 := s.ItoAddress(3)
 
-	got1, _ := s.db.FindOrCreateSigner(addr1)
-	got2, _ := s.db.FindOrCreateSigner(addr2)
-	got3, _ := s.db.FindOrCreateSigner(addr3)
+	got1, _ := s.db.FindOrCreate(addr1)
+	got2, _ := s.db.FindOrCreate(addr2)
+	got3, _ := s.db.FindOrCreate(addr3)
 	assert(got1, got2, got3)
 
-	got1, _ = s.db.FindOrCreateSigner(addr1)
-	got2, _ = s.db.FindOrCreateSigner(addr2)
-	got3, _ = s.db.FindOrCreateSigner(addr3)
+	got1, _ = s.db.FindOrCreate(addr1)
+	got2, _ = s.db.FindOrCreate(addr2)
+	got3, _ = s.db.FindOrCreate(addr3)
 	assert(got1, got2, got3)
 }

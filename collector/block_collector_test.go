@@ -21,7 +21,7 @@ type BlockCollectorTestSuite struct {
 	testhelper.Suite
 
 	db      *database.Database
-	backend *backend.TestBackend
+	backend *backend.Backend
 }
 
 func TestBlockCollector(t *testing.T) {
@@ -30,7 +30,7 @@ func TestBlockCollector(t *testing.T) {
 
 func (s *BlockCollectorTestSuite) SetupTest() {
 	s.db, _ = database.NewDatabase(&config.Database{Path: ":memory:"})
-	s.backend = backend.NewTestBackend()
+	s.backend = backend.NewBackend(nil, 0)
 }
 
 func (s *BlockCollectorTestSuite) TestCollectNewBlocks() {
@@ -106,7 +106,7 @@ func (s *BlockCollectorTestSuite) TestHandleReorganization() {
 }
 
 type reorgBackend struct {
-	*backend.TestBackend
+	*backend.Backend
 
 	mu *sync.Mutex
 	do bool
@@ -115,15 +115,15 @@ type reorgBackend struct {
 }
 
 func newReorgBackend(
-	tb *backend.TestBackend,
+	tb *backend.Backend,
 	mined []*types.Header,
 	reorgedBlock uint64,
 ) *reorgBackend {
 	b := &reorgBackend{
-		TestBackend: tb,
-		mu:          &sync.Mutex{},
-		mined:       mined,
-		reorged:     make([]*types.Header, len(mined)),
+		Backend: tb,
+		mu:      &sync.Mutex{},
+		mined:   mined,
+		reorged: make([]*types.Header, len(mined)),
 	}
 
 	for i, src := range mined {
@@ -147,7 +147,7 @@ func (r *reorgBackend) reorg() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	h := r.TestBackend.Mining()
+	h := r.Backend.Mining()
 	h.ParentHash = r.reorged[len(r.reorged)-1].Hash()
 
 	r.reorged = append(r.reorged, h)
@@ -155,7 +155,7 @@ func (r *reorgBackend) reorg() {
 }
 
 func (r *reorgBackend) NewBatchHeaderClient() (ethutil.BatchHeaderClient, error) {
-	return &backend.TestBatchHeaderClient{ReadOnlyClient: r}, nil
+	return &backend.TestBatchHeaderClient{Client: r}, nil
 }
 
 func (r *reorgBackend) HeaderByNumber(_ context.Context, b *big.Int) (*types.Header, error) {

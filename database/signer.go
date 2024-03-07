@@ -7,12 +7,9 @@ import (
 	"gorm.io/gorm"
 )
 
-type SignerDatabase struct {
-	rawdb *gorm.DB
-	db    *Database
-}
+type SignerDB modeldb
 
-func (db *SignerDatabase) FindOrCreateSigner(signer common.Address) (row *Signer, err error) {
+func (db *SignerDB) FindOrCreate(signer common.Address) (row *Signer, err error) {
 	err = db.rawdb.Transaction(func(txdb *gorm.DB) error {
 		tx := txdb.Where("address = ?", signer).First(&row)
 		if errors.Is(tx.Error, gorm.ErrRecordNotFound) {

@@ -367,8 +367,14 @@ type Submitter struct {
 	// Maximum number of calls for Multicall2.
 	BatchSize int `json:"batch_size" mapstructure:"batch_size"`
 
-	// Address of the OasysStateCommitmentChain contract.
+	// Deprecated: Address of the OasysStateCommitmentChainVerifier contract.
 	VerifierAddress string `json:"verifier_address" mapstructure:"verifier_address"`
+
+	// Address of the OasysStateCommitmentChainVerifier contract.
+	SCCVerifierAddress string `json:"scc_verifier_address" mapstructure:"scc_verifier_address"`
+
+	// Address of the OasysL2OutputOracleVerifier contract.
+	L2OOVerifierAddress string `json:"l2oo_verifier_address" mapstructure:"l2oo_verifier_address"`
 
 	// Address of the Multicall2 contract.
 	UseMulticall      bool   `json:"use_multicall" mapstructure:"use_multicall"`

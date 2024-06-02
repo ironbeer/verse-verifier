@@ -24,3 +24,12 @@ ARG COMMIT=""
 ARG VERSION=""
 
 LABEL commit="$COMMIT" version="$VERSION"
+
+# Binary extraction stage
+FROM scratch as binaries
+
+ARG VERSION
+ARG TARGETOS
+ARG TARGETARCH
+
+COPY --from=builder /build/oasvlfy /oasvlfy
